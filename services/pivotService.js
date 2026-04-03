@@ -206,10 +206,15 @@ function normalizeFiltersInput(rawFilters) {
   return out;
 }
 
+/** When rows/columns are set but Values is empty — same idea as Excel (implicit row count per cell). */
+const DEFAULT_PIVOT_VALUES_WHEN_AXES_ONLY = Object.freeze([
+  { field: 'id', agg: 'count', label: 'Count of rows' },
+]);
+
 function normalizeConfig(config = {}) {
   const rows = unique((config.rows || []).filter((f) => SALES_FIELDS.includes(f)));
   const columns = unique((config.columns || []).filter((f) => SALES_FIELDS.includes(f)));
-  const values = (config.values || [])
+  let values = (config.values || [])
     .filter((v) => v && SALES_FIELDS.includes(v.field))
     .map((v) => ({
       field: v.field,
@@ -217,6 +222,9 @@ function normalizeConfig(config = {}) {
       label: v.label || `${String(v.agg || 'sum').toUpperCase()} ${v.field}`,
     }))
     .filter((v) => ['sum', 'count', 'avg', 'min', 'max'].includes(v.agg));
+  if (values.length === 0 && (rows.length > 0 || columns.length > 0)) {
+    values = [...DEFAULT_PIVOT_VALUES_WHEN_AXES_ONLY];
+  }
   const filters = normalizeFiltersInput(config.filters);
   const sort = normalizePivotSort(config.sort);
   const rawLimit = Number(config.limitRows);
@@ -928,7 +936,7 @@ export function getPivotFields() {
 export async function runPivot(config = {}) {
   const normalized = normalizeConfig(config);
   if (!normalized.values.length) {
-    throw new Error('Select at least one value field');
+    throw new Error('Add at least one field to Rows, Columns, or Values.');
   }
   const pCacheKey = pivotResultCacheKey(normalized);
 
@@ -974,7 +982,7 @@ export async function runPivot(config = {}) {
 export async function runDrilldown(config = {}, drill = {}) {
   const normalized = normalizeConfig(config);
   if (!normalized.values.length) {
-    throw new Error('Select at least one value field');
+    throw new Error('Add at least one field to Rows, Columns, or Values.');
   }
   const { sqlFilters, memFilters } = splitFilters(normalized.filters);
   const offset = Math.max(0, Number(drill.offset) || 0);
