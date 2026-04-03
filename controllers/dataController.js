@@ -18,9 +18,9 @@ import {
 import { logInfo, logError } from '../utils/logger.js';
 
 /** Cache exact row counts so paging the Data tab does not re-run COUNT(*) every request (large tables). */
-const COUNT_CACHE_TTL_MS = Number(process.env.DATA_COUNT_CACHE_TTL_MS) || 90 * 1000;
+const COUNT_CACHE_TTL_MS = Number(process.env.DATA_COUNT_CACHE_TTL_MS) || 120 * 1000;
 const FILTER_OPTIONS_CACHE_TTL_MS = Number(process.env.DATA_FILTER_OPTIONS_CACHE_TTL_MS) || 60 * 1000;
-const DATA_PAGE_CACHE_TTL_MS = Number(process.env.DATA_PAGE_CACHE_TTL_MS) || 5000;
+const DATA_PAGE_CACHE_TTL_MS = Number(process.env.DATA_PAGE_CACHE_TTL_MS) || 15_000;
 const DATA_PAGE_CACHE_MAX = Number(process.env.DATA_PAGE_CACHE_MAX) || 150;
 const dataPageCache = new Map();
 
@@ -226,7 +226,7 @@ function canSkipRuntimeEnrichment(rows) {
 export async function getData(req, res) {
   try {
     let page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(200, Math.max(10, parseInt(req.query.limit) || 100));
+    const limit = Math.min(300, Math.max(10, parseInt(req.query.limit) || 100));
     // Set includeTotal=0 to skip COUNT (faster but no exact page count). Data UI defaults to totals for full pagination.
     const includeTotal = String(req.query.includeTotal ?? '1') === '1';
     const maxPageByCap = Math.max(1, Math.ceil(MAX_SALES_ROWS / limit));

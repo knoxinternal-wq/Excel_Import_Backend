@@ -1,5 +1,5 @@
-/** Upper bound for sales rows: pagination, pivot scan, import, and UI stay aligned (~8L+ headroom) */
-export const MAX_SALES_ROWS = 1_000_000;
+/** Upper bound for sales rows: pagination, pivot scan, import, and UI stay aligned (~18L+ headroom) */
+export const MAX_SALES_ROWS = 2_500_000;
 
 /** Skip first 2 rows (Report Name, Generated Date) and ignore column A */
 export const SKIP_ROWS = 2;
