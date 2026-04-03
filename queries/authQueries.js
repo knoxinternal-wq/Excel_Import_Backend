@@ -1,4 +1,5 @@
 import { supabase } from '../models/supabase.js';
+import { getPgPool } from '../config/database.js';
 
 const DEFAULT_USERS = [
   {
@@ -16,6 +17,10 @@ const DEFAULT_USERS = [
 ];
 
 let seedAttempted = false;
+
+const USER_CACHE_TTL_MS = Number(process.env.AUTH_USER_CACHE_TTL_MS) || 10 * 60 * 1000;
+const userCache = new Map(); // normalizedEmail -> { ts, user }
+const userInflight = new Map(); // normalizedEmail -> Promise<user|null>
 
 function normalizeEmail(email) {
   return String(email || '').trim().toLowerCase();
@@ -51,26 +56,69 @@ async function fetchUserFromSupabase(normalized) {
   return null;
 }
 
+async function fetchUserFromPg(normalized) {
+  const pool = getPgPool();
+  if (!pool) return null;
+
+  // Uses direct Postgres lookup for speed. If RLS blocks (role mismatch), result will be null and
+  // we fall back to Supabase REST.
+  const { rows } = await pool.query(
+    `SELECT id, email, password, full_name, is_active
+     FROM app_users
+     WHERE email = $1 AND is_active = true
+     LIMIT 1`,
+    [normalized],
+  );
+  return rows?.[0] ?? null;
+}
+
 export async function findUserByEmail(email) {
   const normalized = normalizeEmail(email);
   if (!normalized) return null;
 
-  const [, data] = await Promise.all([
-    seedDefaultUsersIfPossible(),
-    fetchUserFromSupabase(normalized),
-  ]);
+  const now = Date.now();
+  const cached = userCache.get(normalized);
+  if (cached && now - cached.ts < USER_CACHE_TTL_MS) {
+    return cached.user;
+  }
 
-  if (data) return data;
+  if (userInflight.has(normalized)) {
+    return userInflight.get(normalized);
+  }
 
-  const fallback = DEFAULT_USERS.find((u) => normalizeEmail(u.email) === normalized && u.is_active);
-  if (!fallback) return null;
+  const p = (async () => {
+    // Seed can run once; do it in parallel with the lookup.
+    await Promise.all([seedDefaultUsersIfPossible()]);
 
-  return {
-    id: `local-${normalized}`,
-    email: fallback.email,
-    password: fallback.password,
-    full_name: fallback.full_name,
-    is_active: fallback.is_active,
-  };
+    // Fast path: direct Postgres.
+    const pgUser = await fetchUserFromPg(normalized);
+    if (pgUser) return pgUser;
+
+    // Compatibility path: Supabase REST.
+    const sbUser = await fetchUserFromSupabase(normalized);
+    if (sbUser) return sbUser;
+
+    // Final fallback: hardcoded dev users (works even if app_users table/policies aren't ready).
+    const fallback = DEFAULT_USERS.find((u) => normalizeEmail(u.email) === normalized && u.is_active);
+    if (!fallback) return null;
+
+    return {
+      id: `local-${normalized}`,
+      email: fallback.email,
+      password: fallback.password,
+      full_name: fallback.full_name,
+      is_active: fallback.is_active,
+    };
+  })();
+
+  userInflight.set(normalized, p);
+  try {
+    const user = await p;
+    userCache.set(normalized, { ts: now, user });
+    return user;
+  } finally {
+    userInflight.delete(normalized);
+  }
+
 }
 
