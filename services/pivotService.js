@@ -507,7 +507,9 @@ function splitFilters(filters) {
   for (const f of filters || []) {
     if (!f || !f.field || !SALES_FIELDS.includes(f.field)) continue;
     if (f.field === 'id') {
-      memFilters.push(f);
+      // Keep id filters in SQL path so we don't fall back to slow in-memory streaming.
+      // Postgres pivot already has special id handling in `pivotSql.buildWhereFromSqlFilters()`.
+      sqlFilters.push(f);
       continue;
     }
     const op = String(f.operator || 'eq').toLowerCase();
@@ -535,20 +537,8 @@ function splitFilters(filters) {
       memFilters.push(f);
       continue;
     }
-    // ILIKE wildcards: without ESCAPE, % and _ must match in-memory filterMatch semantics.
-    if ((op === 'eq' || op === 'contains') && !NUMERIC_FIELDS.has(f.field) && !DATE_FIELDS.has(f.field)) {
-      if (/[%_]/.test(String(f.value ?? ''))) {
-        memFilters.push(f);
-        continue;
-      }
-    }
-    if (op === 'in' && !NUMERIC_FIELDS.has(f.field) && !DATE_FIELDS.has(f.field)) {
-      const vals = Array.isArray(f.values) ? f.values : [];
-      if (vals.some((v) => /[%_]/.test(String(v ?? '')))) {
-        memFilters.push(f);
-        continue;
-      }
-    }
+    // `%` and `_` are treated as literal characters in SQL because we escape them in `applyOneSqlFilter()`.
+    // That means we can keep these filters in the SQL path instead of forcing the slow stream+in-memory fallback.
     sqlFilters.push(f);
   }
   return { sqlFilters, memFilters };
