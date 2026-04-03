@@ -35,12 +35,7 @@ async function seedDefaultUsersIfPossible() {
   }
 }
 
-export async function findUserByEmail(email) {
-  const normalized = normalizeEmail(email);
-  if (!normalized) return null;
-
-  await seedDefaultUsersIfPossible();
-
+async function fetchUserFromSupabase(normalized) {
   try {
     const { data, error } = await supabase
       .from('app_users')
@@ -53,6 +48,19 @@ export async function findUserByEmail(email) {
   } catch {
     // Ignore and fallback to default users.
   }
+  return null;
+}
+
+export async function findUserByEmail(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized) return null;
+
+  const [, data] = await Promise.all([
+    seedDefaultUsersIfPossible(),
+    fetchUserFromSupabase(normalized),
+  ]);
+
+  if (data) return data;
 
   const fallback = DEFAULT_USERS.find((u) => normalizeEmail(u.email) === normalized && u.is_active);
   if (!fallback) return null;

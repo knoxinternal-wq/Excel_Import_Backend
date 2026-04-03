@@ -33,12 +33,12 @@ const FILTER_VALUES_CACHE_TTL_MS = Number(process.env.PIVOT_FILTER_VALUES_CACHE_
 const FILTER_VALUES_CACHE_MAX = Number(process.env.PIVOT_FILTER_VALUES_CACHE_MAX) || 100;
 const filterValuesCache = new Map();
 
-/** Per-statement timeout for pivot SQL (ms). 0 = disable timeout. Default 3m — avoids Supabase ~8s default on heavy GROUP BY. */
+/** Per-statement timeout for pivot SQL (ms). 0 = disable timeout. Default 10m — heavy pivots exceed 3m; pool still uses SET LOCAL. */
 function getPivotStatementTimeoutMs() {
   const raw = process.env.PIVOT_PG_STATEMENT_TIMEOUT_MS;
-  if (raw === undefined || raw === '') return 180_000;
+  if (raw === undefined || raw === '') return 600_000;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) return 180_000;
+  if (!Number.isFinite(n) || n < 0) return 600_000;
   return Math.floor(n);
 }
 
