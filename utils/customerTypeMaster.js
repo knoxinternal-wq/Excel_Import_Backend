@@ -1,6 +1,8 @@
 /**
  * customer_type_master → sales_data.business_type ("TYPE OF Business").
- * Match: sales_data.to_party_name ↔ master party column; value ↔ master TYPE column.
+ * Match: normalize(sales_data.to_party_name) ↔ normalize(customer_type_master.party_name).
+ * Value: customer_type_master.type (DB column `type`; may appear as TYPE in exports).
+ * No match (or empty to_party_name): DEFAULT_BUSINESS_TYPE ('RETAILER').
  */
 import { normalizePartyName, getPartyNameAliasKeys } from './normalizeHeader.js';
 

@@ -2,6 +2,7 @@
  * Node-side enrichment for sales_data rows (replaces SQL joins + CASE in transformStagingToFact).
  */
 import { normalizePartyName, getPartyNameAliasKeys, normalizeAgentName, getAgentNameExactKey } from '../../utils/normalizeHeader.js';
+import { resolveBusinessType } from '../../utils/customerTypeMaster.js';
 import { resolveSoType } from '../../utils/soTypeMaster.js';
 
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -184,29 +185,22 @@ function deriveItemWithShade(data) {
   data.item_with_shade = parts.length > 0 ? parts.join(' ') : null;
 }
 
-function resolveMasterBusinessType(toPartyName, customerTypeByParty) {
-  const key = normalizePartyName(toPartyName);
-  if (!key) return null;
-  let t = customerTypeByParty?.get(key);
-  if (!t) {
-    for (const alt of getPartyNameAliasKeys(toPartyName)) {
-      t = customerTypeByParty?.get(alt);
-      if (t) break;
-    }
-  }
-  return t != null ? String(t).trim() : null;
-}
-
+/**
+ * TYPE OF Business (`business_type`):
+ * - Match `sales_data.to_party_name` to `customer_type_master.party_name` (via normalized map built from that table).
+ * - Use `customer_type_master.type` (column may appear as `type` / `TYPE` from PostgREST).
+ * - If no row matches, use RETAILER only (see `resolveBusinessType`).
+ * - Excel "TYPE OF Business" is not imported; this is the sole source during ingest.
+ * - ITALIAN CHANNEL + RETAILER → DISTRIBUTOR (existing business rule).
+ */
 function applyBusinessTypeAndItalianChannel(data, customerTypeByParty) {
-  const masterType = resolveMasterBusinessType(data.to_party_name, customerTypeByParty);
-  const sheetType = data.business_type != null ? String(data.business_type).trim() : '';
-  const base = masterType ?? (sheetType || null);
+  const resolved = resolveBusinessType(data.to_party_name, customerTypeByParty);
   const branchForRule = data?.branch != null ? String(data.branch).trim().toUpperCase() : '';
-  const typeForRule = base != null ? String(base).trim().toUpperCase() : '';
+  const typeForRule = String(resolved || '').trim().toUpperCase();
   if (branchForRule === 'ITALIAN CHANNEL' && typeForRule === 'RETAILER') {
     data.business_type = 'DISTRIBUTOR';
   } else {
-    data.business_type = base ?? data.business_type ?? null;
+    data.business_type = resolved;
   }
 }
 
