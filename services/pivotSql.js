@@ -41,7 +41,7 @@ function getMaxGroupDimensions() {
 }
 
 const MAX_VALUE_SPECS = 12;
-const FILTER_VALUES_CACHE_TTL_MS = Number(process.env.PIVOT_FILTER_VALUES_CACHE_TTL_MS) || 15 * 60 * 1000;
+const FILTER_VALUES_CACHE_TTL_MS = Number(process.env.PIVOT_FILTER_VALUES_CACHE_TTL_MS) || 30 * 60 * 1000;
 const FILTER_VALUES_CACHE_MAX = Number(process.env.PIVOT_FILTER_VALUES_CACHE_MAX) || 100;
 const filterValuesCache = new Map();
 
@@ -318,15 +318,12 @@ export async function queryDistinctPivotFilterValues(field, search = '', limit =
       params.push(`%${escapeIlike(term)}%`);
       extra = ` AND ${col}::text ILIKE $1 ESCAPE '\\'`;
     }
+    // DISTINCT + ORDER BY + LIMIT: matches expression indexes on (btrim(col::text)) for hot dims.
     const sql = `
-      SELECT grp AS v
-      FROM (
-        SELECT BTRIM(${col}::text) AS grp
-        FROM sales_data
-        WHERE ${col} IS NOT NULL AND BTRIM(${col}::text) <> ''
-        ${extra}
-        GROUP BY BTRIM(${col}::text)
-      ) t
+      SELECT DISTINCT BTRIM(${col}::text) AS v
+      FROM sales_data
+      WHERE ${col} IS NOT NULL AND BTRIM(${col}::text) <> ''
+      ${extra}
       ORDER BY 1
       LIMIT ${lim}
     `;

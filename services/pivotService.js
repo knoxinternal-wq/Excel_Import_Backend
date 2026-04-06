@@ -1104,22 +1104,29 @@ export async function getFilterValuesBatch(rawFields, limit = 500) {
   const lim = Math.min(2000, Math.max(50, Number(limit) || 500));
   if (list.length === 0) throw new Error('No filter fields');
   if (list.length > 24) throw new Error('Too many fields (max 24 per batch)');
-  const entries = await Promise.all(
-    list.map(async (field) => {
-      if (!SALES_FIELDS.includes(field)) {
-        return [field, { values: [], error: 'Invalid filter field' }];
-      }
-      try {
-        const distinct = await queryDistinctPivotFilterValues(field, '', lim);
-        if (distinct == null) {
-          return [field, { values: [], error: 'Unable to fetch distinct filter values from SQL' }];
+  // Run at most 2 DISTINCT queries in parallel — N parallel full scans on sales_data overload small DBs.
+  const CONCURRENCY = 2;
+  const entries = [];
+  for (let i = 0; i < list.length; i += CONCURRENCY) {
+    const chunk = list.slice(i, i + CONCURRENCY);
+    const chunkResults = await Promise.all(
+      chunk.map(async (field) => {
+        if (!SALES_FIELDS.includes(field)) {
+          return [field, { values: [], error: 'Invalid filter field' }];
         }
-        distinct.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-        return [field, { values: distinct }];
-      } catch (e) {
-        return [field, { values: [], error: e?.message || 'Filter values failed' }];
-      }
-    }),
-  );
+        try {
+          const distinct = await queryDistinctPivotFilterValues(field, '', lim);
+          if (distinct == null) {
+            return [field, { values: [], error: 'Unable to fetch distinct filter values from SQL' }];
+          }
+          distinct.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+          return [field, { values: distinct }];
+        } catch (e) {
+          return [field, { values: [], error: e?.message || 'Filter values failed' }];
+        }
+      }),
+    );
+    entries.push(...chunkResults);
+  }
   return Object.fromEntries(entries);
 }
