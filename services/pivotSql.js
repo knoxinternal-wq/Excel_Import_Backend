@@ -33,17 +33,35 @@ const NUMERIC_FIELDS = SALES_DATA_NUMERIC_COLUMNS_SET;
 const DATE_FIELDS = new Set(['bill_date', 'sale_order_date', 'created_at']);
 const PARTY_EQ_FIELDS = new Set(['to_party_name', 'party_grouped', 'party_name_for_count']);
 
-/** Wider default for large fact tables (1M+ rows); cap with PIVOT_MAX_GROUP_DIMENSIONS=4..32 */
+/** Guardrail for scalable pivot fan-out; cap with PIVOT_MAX_GROUP_DIMENSIONS=2..8. */
 function getMaxGroupDimensions() {
   const n = Number(process.env.PIVOT_MAX_GROUP_DIMENSIONS);
-  if (Number.isFinite(n) && n >= 4 && n <= 32) return Math.floor(n);
-  return 18;
+  if (Number.isFinite(n) && n >= 2 && n <= 8) return Math.floor(n);
+  return 5;
 }
 
 const MAX_VALUE_SPECS = 12;
-const FILTER_VALUES_CACHE_TTL_MS = Number(process.env.PIVOT_FILTER_VALUES_CACHE_TTL_MS) || 30 * 60 * 1000;
+const FILTER_VALUES_CACHE_TTL_MS = Number(process.env.PIVOT_FILTER_VALUES_CACHE_TTL_MS) || 60 * 60 * 1000;
 const FILTER_VALUES_CACHE_MAX = Number(process.env.PIVOT_FILTER_VALUES_CACHE_MAX) || 100;
 const filterValuesCache = new Map();
+const SALES_ALL_DIMS_MV_NAME = process.env.PIVOT_MV_ALL_DIMS || 'mv_sales_all_dims';
+const ALL_DIMS_MV_FIELDS = new Set([
+  'branch',
+  'region',
+  'state',
+  'district',
+  'city',
+  'brand',
+  'party_grouped',
+  'agent_name',
+  'fy',
+  'month',
+  'mmm',
+  'so_type',
+  'item_category',
+  'item_sub_cat',
+  'goods_type',
+]);
 
 /**
  * Per-statement timeout for pivot **aggregation** (GROUP BY / MV paths).
@@ -189,6 +207,10 @@ export function getPivotSqlPool() {
   return getPgPool();
 }
 
+export function getConfiguredPivotMaxGroupDimensions() {
+  return getMaxGroupDimensions();
+}
+
 function quoteIdent(field) {
   if (!SALES_FIELDS.includes(field)) throw new Error(`Invalid column: ${field}`);
   return `"${String(field).replace(/"/g, '""')}"`;
@@ -288,7 +310,7 @@ export async function queryDistinctPivotFilterValues(field, search = '', limit =
   const p = getPivotSqlPool();
   if (!p) return null;
   const clean = String(field || '').trim();
-  if (!SALES_FIELDS.includes(clean)) throw new Error('Invalid filter field');
+  if (!ALL_DIMS_MV_FIELDS.has(clean)) throw new Error('Invalid filter field');
   const col = quoteIdent(clean);
   const lim = Math.min(20_000, Math.max(1, Math.floor(Number(limit) || 10_000)));
   const term = String(search || '').trim();
@@ -318,10 +340,11 @@ export async function queryDistinctPivotFilterValues(field, search = '', limit =
       params.push(`%${escapeIlike(term)}%`);
       extra = ` AND ${col}::text ILIKE $1 ESCAPE '\\'`;
     }
-    // DISTINCT + ORDER BY + LIMIT: matches expression indexes on (btrim(col::text)) for hot dims.
+    const mvRel = quoteMvName(SALES_ALL_DIMS_MV_NAME);
+    // DISTINCT from pre-aggregated MV dims avoids scanning full `sales_data`.
     const sql = `
       SELECT DISTINCT BTRIM(${col}::text) AS v
-      FROM sales_data
+      FROM ${mvRel}
       WHERE ${col} IS NOT NULL AND BTRIM(${col}::text) <> ''
       ${extra}
       ORDER BY 1
@@ -355,12 +378,16 @@ export function isPivotSqlAggregationEligible(normalized, memFilters) {
   const { rows, columns, values } = normalized;
   if (rows.length + columns.length > getMaxGroupDimensions()) return false;
   if (values.length === 0 || values.length > MAX_VALUE_SPECS) return false;
+  const dims = [...rows, ...columns];
+  if (dims.some((d) => !ALL_DIMS_MV_FIELDS.has(d))) return false;
+  const filters = normalized.filters || [];
+  if (filters.some((f) => !f?.field || !ALL_DIMS_MV_FIELDS.has(f.field))) return false;
+  if (filters.some((f) => !['eq', 'in', 'contains', 'is_blank', 'is_not_blank'].includes(String(f.operator || 'eq').toLowerCase()))) return false;
   for (const v of values) {
     const agg = String(v.agg || '').toLowerCase();
     const field = v.field;
-    if (!['sum', 'count', 'avg', 'min', 'max'].includes(agg)) return false;
-    if (field === 'id' && agg !== 'count') return false;
-    if (agg !== 'count' && !NUMERIC_FIELDS.has(field)) return false;
+    if (!['sum', 'count'].includes(agg)) return false;
+    if (agg === 'sum' && !['net_amount', 'sl_qty'].includes(field)) return false;
   }
   return true;
 }
@@ -675,6 +702,56 @@ async function queryPivotFromSalesPivotMv(normalized, sqlFilters) {
   });
 }
 
+async function queryPivotFromAllDimsMv(normalized, sqlFilters) {
+  const mvRel = quoteMvName(SALES_ALL_DIMS_MV_NAME);
+  const { rows: rowFields, columns: colFields, values } = normalized;
+  const selectDim = [];
+  const groupDim = [];
+  let idx = 0;
+  for (const f of rowFields) {
+    const a = `dr_${idx++}`;
+    selectDim.push(`mv.${quoteIdent(f)} AS ${a}`);
+    groupDim.push(`mv.${quoteIdent(f)}`);
+  }
+  let c = 0;
+  for (const f of colFields) {
+    const a = `dc_${c++}`;
+    selectDim.push(`mv.${quoteIdent(f)} AS ${a}`);
+    groupDim.push(`mv.${quoteIdent(f)}`);
+  }
+
+  const aggSelects = [];
+  values.forEach((v, vi) => {
+    const agg = String(v.agg || '').toLowerCase();
+    if (agg === 'count') {
+      aggSelects.push(`SUM(COALESCE(mv.row_count, 0))::bigint AS agg_cnt_${vi}`);
+      return;
+    }
+    const field = String(v.field || '').toLowerCase();
+    if (field === 'net_amount') {
+      aggSelects.push(`SUM(COALESCE(mv.sum_net_amount, 0)) AS agg_sum_${vi}`);
+      aggSelects.push(`SUM(COALESCE(mv.row_count, 0))::bigint AS agg_rowcnt_${vi}`);
+      return;
+    }
+    aggSelects.push(`SUM(COALESCE(mv.sum_sl_qty, 0)) AS agg_sum_${vi}`);
+    aggSelects.push(`SUM(COALESCE(mv.row_count, 0))::bigint AS agg_rowcnt_${vi}`);
+  });
+
+  const { whereSql, params } = buildWhereFromSqlFilters(sqlFilters, 'mv');
+  const groupClause = groupDim.length ? `GROUP BY ${groupDim.map((_, i) => i + 1).join(', ')}` : '';
+  const sql = `
+    SELECT ${[...selectDim, ...aggSelects].join(',\n      ')}
+    FROM ${mvRel} mv
+    ${whereSql}
+    ${groupClause}
+  `.trim();
+  return withPivotSqlClient(async (client) => {
+    const groupRes = await client.query(sql, params);
+    const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
+    return { rows: groupRes.rows, filteredRowCount };
+  });
+}
+
 /** GROUP BY expression: BTRIM text dims (matches Excel import trim) so e.g. "DON AND JULIO " does not split from "DON AND JULIO". */
 function dimSelectExpr(field, alias) {
   const col = `sd.${quoteIdent(field)}`;
@@ -796,59 +873,7 @@ export async function queryPivotGroupBy(normalized, sqlFilters) {
   const pool = getPivotSqlPool();
   if (!pool) throw new Error('No database pool');
 
-  if (matchSalesPivotMvEligible(normalized)) {
-    try {
-      return await queryPivotFromSalesPivotMv(normalized, sqlFilters);
-    } catch (e) {
-      logDebug('pivotSql', 'sales_pivot_mv fallback', { error: String(e?.message || e) });
-    }
-  }
-
-  if (matchBrandStateMonthMaterializedView(normalized, sqlFilters)) {
-    try {
-      return await queryPivotFromBrandStateMonthMv(sqlFilters);
-    } catch (e) {
-      logDebug('pivotSql', 'materialized view pivot fallback', { error: String(e?.message || e) });
-    }
-  }
-
-  const { rows: rowFields, columns: colFields, values } = normalized;
-  const selectDim = [];
-  const groupDim = [];
-  let idx = 0;
-  for (const f of rowFields) {
-    const a = `dr_${idx++}`;
-    selectDim.push(dimSelectExpr(f, a));
-    groupDim.push(dimGroupExpr(f));
-  }
-  let c = 0;
-  for (const f of colFields) {
-    const a = `dc_${c++}`;
-    selectDim.push(dimSelectExpr(f, a));
-    groupDim.push(dimGroupExpr(f));
-  }
-
-  const aggSelects = [];
-  values.forEach((v, vi) => {
-    const { select } = aggSelectSql(v, vi);
-    aggSelects.push(select);
-  });
-
-  const { whereSql, params } = buildWhereFromSqlFilters(sqlFilters);
-  const groupClause = groupDim.length ? `GROUP BY ${groupDim.map((_, i) => i + 1).join(', ')}` : '';
-
-  const sql = `
-    SELECT ${[...selectDim, ...aggSelects].join(',\n      ')}
-    FROM sales_data sd
-    ${whereSql}
-    ${groupClause}
-  `.trim();
-
-  return withPivotSqlClient(async (client) => {
-    const groupRes = await client.query(sql, params);
-    const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
-    return { rows: groupRes.rows, filteredRowCount };
-  });
+  return queryPivotFromAllDimsMv(normalized, sqlFilters);
 }
 
 function splitPivotKey(key, n) {
