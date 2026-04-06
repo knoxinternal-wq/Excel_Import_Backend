@@ -2,8 +2,14 @@
  * PostgreSQL-side pivot aggregation and drilldown (optional).
  * Uses shared `DATABASE_URL` pool from `config/database.js`. On failure, callers fall back to Node streaming.
  */
+import crypto from 'crypto';
 import { getPgPool } from '../config/database.js';
 import { logDebug } from '../utils/logger.js';
+import {
+  isPivotRedisConfigured,
+  pivotFilterValuesRedisGet,
+  pivotFilterValuesRedisSet,
+} from './pivotRedisCache.js';
 import { SALES_DATA_NUMERIC_COLUMNS_SET, parseFactNumeric } from '../utils/salesFacts.js';
 
 const SALES_FIELDS = [
@@ -27,29 +33,91 @@ const NUMERIC_FIELDS = SALES_DATA_NUMERIC_COLUMNS_SET;
 const DATE_FIELDS = new Set(['bill_date', 'sale_order_date', 'created_at']);
 const PARTY_EQ_FIELDS = new Set(['to_party_name', 'party_grouped', 'party_name_for_count']);
 
-const MAX_GROUP_DIMENSIONS = 14;
+/** Wider default for large fact tables (1M+ rows); cap with PIVOT_MAX_GROUP_DIMENSIONS=4..32 */
+function getMaxGroupDimensions() {
+  const n = Number(process.env.PIVOT_MAX_GROUP_DIMENSIONS);
+  if (Number.isFinite(n) && n >= 4 && n <= 32) return Math.floor(n);
+  return 18;
+}
+
 const MAX_VALUE_SPECS = 12;
-const FILTER_VALUES_CACHE_TTL_MS = Number(process.env.PIVOT_FILTER_VALUES_CACHE_TTL_MS) || 5 * 60 * 1000;
+const FILTER_VALUES_CACHE_TTL_MS = Number(process.env.PIVOT_FILTER_VALUES_CACHE_TTL_MS) || 15 * 60 * 1000;
 const FILTER_VALUES_CACHE_MAX = Number(process.env.PIVOT_FILTER_VALUES_CACHE_MAX) || 100;
 const filterValuesCache = new Map();
 
-/** Per-statement timeout for pivot SQL (ms). 0 = disable timeout. Default 10m — heavy pivots exceed 3m; pool still uses SET LOCAL. */
-function getPivotStatementTimeoutMs() {
+/**
+ * Per-statement timeout for pivot **aggregation** (GROUP BY / MV paths). Default 5s.
+ * Set `PIVOT_PG_STATEMENT_TIMEOUT_MS` (ms) to override; use `0` to disable.
+ * If unset, `PIVOT_SLA_MS` is used when you want SLA without renaming the PG var.
+ */
+function getPivotAggregationTimeoutMs() {
   const raw = process.env.PIVOT_PG_STATEMENT_TIMEOUT_MS;
-  if (raw === undefined || raw === '') return 600_000;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0) return 600_000;
-  return Math.floor(n);
+  if (raw !== undefined && raw !== '') {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return 5000;
+    return Math.floor(n);
+  }
+  const sla = process.env.PIVOT_SLA_MS;
+  if (sla !== undefined && sla !== '') {
+    const n = Number(sla);
+    if (!Number.isFinite(n) || n < 0) return 5000;
+    return Math.floor(n);
+  }
+  return 5000;
 }
 
 /**
- * Run pivot reads on one connection with a raised statement_timeout (pool.query uses random clients; timeouts were per-connection defaults).
+ * DISTINCT filter lists + drilldown SQL — separate budget so dropdowns still work when the cube is capped at 5s.
+ * Override with `PIVOT_FILTER_SQL_TIMEOUT_MS` (ms); `0` = off.
  */
-async function withPivotSqlClient(runner) {
+function getPivotSupportingSqlTimeoutMs() {
+  const raw = process.env.PIVOT_FILTER_SQL_TIMEOUT_MS;
+  if (raw !== undefined && raw !== '') {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return 90_000;
+    return Math.floor(n);
+  }
+  return 90_000;
+}
+
+function resolveStatementTimeoutMs(options = {}) {
+  if (options.timeoutMs !== undefined && options.timeoutMs !== null) {
+    const n = Math.floor(Number(options.timeoutMs));
+    if (!Number.isFinite(n) || n < 0) return getPivotAggregationTimeoutMs();
+    return n;
+  }
+  return getPivotAggregationTimeoutMs();
+}
+
+/** Larger hash aggregates for million-row GROUP BY (e.g. PIVOT_PG_WORK_MEM=256MB). */
+function pivotSessionWorkMemSql() {
+  const raw = String(process.env.PIVOT_PG_WORK_MEM || '').trim();
+  if (!raw) return null;
+  const compact = raw.replace(/\s+/g, '').toUpperCase();
+  if (!/^\d+(KB|MB|GB|TB)$/.test(compact)) return null;
+  const escaped = compact.replace(/'/g, "''");
+  return `SET LOCAL work_mem = '${escaped}'`;
+}
+
+/** Parallel hash aggregate / seq scan (0–8). Empty env = leave server default. */
+function pivotSessionParallelGatherSql() {
+  const raw = String(process.env.PIVOT_PG_PARALLEL_WORKERS || '').trim();
+  if (raw === '') return null;
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < 0 || n > 8) return null;
+  return `SET LOCAL max_parallel_workers_per_gather = ${n}`;
+}
+
+/**
+ * Run pivot SQL on one connection with SET LOCAL statement_timeout (each statement in `runner` gets this cap).
+ * @param {(client: import('pg').PoolClient) => Promise<unknown>} runner
+ * @param {{ timeoutMs?: number }} [options] — omit to use pivot aggregation default; pass supporting timeout for filters/drilldown.
+ */
+async function withPivotSqlClient(runner, options = {}) {
   const p = getPivotSqlPool();
   if (!p) throw new Error('No database pool');
   const client = await p.connect();
-  const ms = getPivotStatementTimeoutMs();
+  const ms = resolveStatementTimeoutMs(options);
   try {
     await client.query('BEGIN');
     if (ms === 0) {
@@ -57,6 +125,10 @@ async function withPivotSqlClient(runner) {
     } else {
       await client.query(`SET LOCAL statement_timeout = '${ms}ms'`);
     }
+    const wm = pivotSessionWorkMemSql();
+    if (wm) await client.query(wm);
+    const par = pivotSessionParallelGatherSql();
+    if (par) await client.query(par);
     const out = await runner(client);
     await client.query('COMMIT');
     return out;
@@ -70,6 +142,14 @@ async function withPivotSqlClient(runner) {
   } finally {
     client.release();
   }
+}
+
+/** Postgres cancel (statement_timeout) — map to HTTP 504 + PIVOT_TIMEOUT in controllers. */
+export function isPivotSqlStatementTimeoutError(err) {
+  if (!err) return false;
+  if (err.code === '57014') return true;
+  const m = String(err.message || '');
+  return /canceling statement due to statement timeout|statement timeout/i.test(m);
 }
 
 /**
@@ -205,6 +285,19 @@ export async function queryDistinctPivotFilterValues(field, search = '', limit =
     return cached.values;
   }
 
+  const redisKeyHash = crypto.createHash('sha256').update(cacheKey).digest('hex');
+  if (isPivotRedisConfigured()) {
+    try {
+      const rHit = await pivotFilterValuesRedisGet(redisKeyHash);
+      if (rHit && Array.isArray(rHit.values)) {
+        filterValuesCache.set(cacheKey, { ts: Date.now(), values: rHit.values });
+        return rHit.values;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
   const values = await withPivotSqlClient(async (client) => {
     const params = [];
     let extra = '';
@@ -213,10 +306,14 @@ export async function queryDistinctPivotFilterValues(field, search = '', limit =
       extra = ` AND ${col}::text ILIKE $1 ESCAPE '\\'`;
     }
     const sql = `
-      SELECT DISTINCT ${col}::text AS v
-      FROM sales_data
-      WHERE ${col} IS NOT NULL AND btrim(${col}::text) <> ''
-      ${extra}
+      SELECT grp AS v
+      FROM (
+        SELECT BTRIM(${col}::text) AS grp
+        FROM sales_data
+        WHERE ${col} IS NOT NULL AND BTRIM(${col}::text) <> ''
+        ${extra}
+        GROUP BY BTRIM(${col}::text)
+      ) t
       ORDER BY 1
       LIMIT ${lim}
     `;
@@ -224,7 +321,11 @@ export async function queryDistinctPivotFilterValues(field, search = '', limit =
     return rows
       .map((r) => String(r?.v ?? '').trim())
       .filter(Boolean);
-  });
+  }, { timeoutMs: getPivotSupportingSqlTimeoutMs() });
+
+  if (isPivotRedisConfigured()) {
+    void pivotFilterValuesRedisSet(redisKeyHash, { values });
+  }
   filterValuesCache.set(cacheKey, { ts: Date.now(), values });
   while (filterValuesCache.size > FILTER_VALUES_CACHE_MAX) {
     const oldestKey = filterValuesCache.keys().next().value;
@@ -242,7 +343,7 @@ export function isPivotSqlAggregationEligible(normalized, memFilters) {
   const pool = getPivotSqlPool();
   if (!pool) return false;
   const { rows, columns, values } = normalized;
-  if (rows.length + columns.length > MAX_GROUP_DIMENSIONS) return false;
+  if (rows.length + columns.length > getMaxGroupDimensions()) return false;
   if (values.length === 0 || values.length > MAX_VALUE_SPECS) return false;
   for (const v of values) {
     const agg = String(v.agg || '').toLowerCase();
@@ -610,7 +711,8 @@ async function queryPivotFromBrandStateMonthMv(sqlFilters) {
   `.trim();
 
   return withPivotSqlClient(async (client) => {
-    const skipFactCount = String(process.env.PIVOT_PG_SKIP_FACT_ROW_COUNT || '').trim() === '1';
+    // Second query is COUNT(*) over filtered sales_data (~1M+ rows). Default off; exact total: PIVOT_PG_SKIP_FACT_ROW_COUNT=0
+    const skipFactCount = String(process.env.PIVOT_PG_SKIP_FACT_ROW_COUNT || '1').trim() !== '0';
     const groupRes = await client.query(groupSql, pMv);
     let filteredRowCount;
     if (skipFactCount) {
@@ -749,5 +851,5 @@ export async function queryDrilldownPage(normalized, sqlFilters, drill) {
       total: Number(countRes.rows[0]?.c ?? 0),
       rows: dataRes.rows,
     };
-  });
+  }, { timeoutMs: getPivotSupportingSqlTimeoutMs() });
 }

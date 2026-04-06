@@ -20,7 +20,7 @@ import { logInfo, logError } from '../utils/logger.js';
 /** Cache exact row counts so paging the Data tab does not re-run COUNT(*) every request (large tables). */
 const COUNT_CACHE_TTL_MS = Number(process.env.DATA_COUNT_CACHE_TTL_MS) || 120 * 1000;
 const FILTER_OPTIONS_CACHE_TTL_MS = Number(process.env.DATA_FILTER_OPTIONS_CACHE_TTL_MS) || 60 * 1000;
-const DATA_PAGE_CACHE_TTL_MS = Number(process.env.DATA_PAGE_CACHE_TTL_MS) || 15_000;
+const DATA_PAGE_CACHE_TTL_MS = Number(process.env.DATA_PAGE_CACHE_TTL_MS) || 45_000;
 const DATA_PAGE_CACHE_MAX = Number(process.env.DATA_PAGE_CACHE_MAX) || 150;
 const dataPageCache = new Map();
 
@@ -223,17 +223,97 @@ function canSkipRuntimeEnrichment(rows) {
   ));
 }
 
+function quoteIdentSql(ident) {
+  const s = String(ident || '');
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(s)) throw new Error('Invalid SQL identifier');
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+function isUnfilteredSalesWhere(whereSql) {
+  return String(whereSql || '').trim() === 'TRUE';
+}
+
+/** ~instant row estimate from planner stats (no full COUNT). Good when WHERE is TRUE. */
+async function getApproximateSalesRowCount(pool) {
+  try {
+    const { rows } = await pool.query(`
+      SELECT GREATEST(
+        COALESCE(NULLIF(s.n_live_tup, 0), 0),
+        COALESCE(NULLIF(FLOOR(c.reltuples)::bigint, 0), 0)
+      )::bigint AS n
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid AND s.schemaname = n.nspname
+      WHERE n.nspname = 'public' AND c.relname = 'sales_data' AND c.relkind = 'r'
+      LIMIT 1
+    `);
+    const n = Number(rows[0]?.n);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n;
+  } catch {
+    return null;
+  }
+}
+
+const MAX_PARTY_NAME_MATCHES = 120;
+
+/** Same filter semantics as PostgREST applyFilters + party_grouping expansion (for DATABASE_URL reads). */
+async function buildSalesDataWhereSqlAndParams(search, state) {
+  const clauses = [];
+  const params = [];
+  const st = state ? String(state).trim() : '';
+  if (st) {
+    params.push(st);
+    clauses.push(`state = $${params.length}`);
+  }
+  const trimmedSearch = String(search || '').trim();
+  if (trimmedSearch.length >= 2) {
+    const ors = [];
+    params.push(`%${trimmedSearch}%`);
+    const ilikeIdx = params.length;
+    ors.push(`bill_no ILIKE $${ilikeIdx}`);
+    ors.push(`party_grouped ILIKE $${ilikeIdx}`);
+    if (trimmedSearch.length >= 3) {
+      const masterRows = await getPartyGroupingSearchRows();
+      const toPartyValues = new Set();
+      for (const r of masterRows || []) {
+        const partyGrouped = r?.['PARTY GROUPED'] ?? r?.party_grouped ?? null;
+        if (!partyGrouped || !String(partyGrouped).toLowerCase().includes(trimmedSearch.toLowerCase())) {
+          continue;
+        }
+        const matchVal = r?.['TO PARTY NAME'] ?? r?.to_party_name ?? r?.party_name;
+        if (!matchVal) continue;
+        toPartyValues.add(String(matchVal));
+        for (const v of getPartyNameFilterValues(matchVal)) {
+          if (v) toPartyValues.add(String(v));
+        }
+        if (toPartyValues.size >= MAX_PARTY_NAME_MATCHES) break;
+      }
+      if (toPartyValues.size > 0) {
+        params.push([...toPartyValues].slice(0, MAX_PARTY_NAME_MATCHES));
+        ors.push(`to_party_name = ANY($${params.length}::text[])`);
+      }
+    }
+    clauses.push(`(${ors.join(' OR ')})`);
+  }
+  return { whereSql: clauses.length ? clauses.join(' AND ') : 'TRUE', params };
+}
+
 export async function getData(req, res) {
   try {
     let page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(300, Math.max(10, parseInt(req.query.limit) || 100));
     // Set includeTotal=0 to skip COUNT (faster but no exact page count). Data UI defaults to totals for full pagination.
     const includeTotal = String(req.query.includeTotal ?? '1') === '1';
+    /** When `1`, forces exact COUNT(*) even if unfiltered (slower). Default uses planner stats (~instant). */
+    const exactTotal = String(req.query.exactTotal ?? '0') === '1';
     const maxPageByCap = Math.max(1, Math.ceil(MAX_SALES_ROWS / limit));
     page = Math.min(page, maxPageByCap);
     const search = req.query.search || '';
     const state = req.query.state || '';
-    const cursorId = Number(req.query.cursorId) || null;
+    const cursorRaw = req.query.cursorId;
+    const cursorId =
+      cursorRaw != null && String(cursorRaw).trim() !== '' ? String(cursorRaw).trim() : null;
     const sortBy = req.query.sortBy || 'id';
     const sortOrder = req.query.sortOrder === 'asc';
     const useKeysetPaging = String(req.query.paging || '').toLowerCase() === 'keyset';
@@ -277,7 +357,6 @@ export async function getData(req, res) {
       return q;
     };
 
-    const MAX_PARTY_NAME_MATCHES = 120;
     const appendPartyMasterSearch = async (orParts, trimmedSearch) => {
       const masterRows = await getPartyGroupingSearchRows();
 
@@ -315,6 +394,7 @@ export async function getData(req, res) {
       page: pageNum,
       limit,
       includeTotal,
+      exactTotal,
       state,
       search: String(search || '').trim().toLowerCase(),
       sortBy: orderColumn,
@@ -327,6 +407,136 @@ export async function getData(req, res) {
       res.set('Cache-Control', 'private, max-age=0, must-revalidate');
       res.set('X-Data-Cache', 'HIT');
       return res.json(cacheItem.payload);
+    }
+
+    const pool = getPgPool();
+    if (pool) {
+      try {
+        const { whereSql, params: filterParams } = await buildSalesDataWhereSqlAndParams(search, state);
+        const disableApprox = String(process.env.DATA_DISABLE_APPROX_COUNT ?? '0') === '1';
+        const useApproxCount = includeTotal && isUnfilteredSalesWhere(whereSql) && !exactTotal && !disableApprox;
+        const approxCountKey = 'sales_data_count_approx|unfiltered';
+        const dataCols = DATA_SELECT.split(',')
+          .map((c) => c.trim())
+          .map(quoteIdentSql)
+          .join(', ');
+        const orderDir = sortOrder ? 'ASC' : 'DESC';
+        const orderColQ = quoteIdentSql(orderColumn);
+
+        const runCountPg = () => getOrLoadMaster(countKey, async () => {
+          const { rows: cr } = await pool.query(
+            `SELECT COUNT(*)::bigint AS c FROM sales_data WHERE ${whereSql}`,
+            filterParams,
+          );
+          return cr[0]?.c != null ? Number(cr[0].c) : 0;
+        }, COUNT_CACHE_TTL_MS);
+
+        const fetchRowsPg = async (pageNum) => {
+          const params = [...filterParams];
+          let sql;
+          if (useKeysetPaging && orderColumn === 'id' && cursorId != null) {
+            const op = sortOrder ? '>' : '<';
+            params.push(cursorId);
+            sql = `SELECT ${dataCols} FROM sales_data WHERE ${whereSql} AND (${orderColQ} ${op} $${params.length}) ORDER BY ${orderColQ} ${orderDir} NULLS LAST LIMIT $${params.length + 1}`;
+            params.push(limit);
+          } else {
+            const offset = (pageNum - 1) * limit;
+            sql = `SELECT ${dataCols} FROM sales_data WHERE ${whereSql} ORDER BY ${orderColQ} ${orderDir} NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+            params.push(limit, offset);
+          }
+          const { rows } = await pool.query(sql, params);
+          return rows;
+        };
+
+        let totalPg = null;
+        let rowsPg = [];
+        let countEstimated = false;
+        const parallelCountAndRowsPg = includeTotal && page === 1 && !useKeysetPaging;
+
+        if (parallelCountAndRowsPg) {
+          if (useApproxCount) {
+            const [approx, rws] = await Promise.all([
+              getOrLoadMaster(approxCountKey, () => getApproximateSalesRowCount(pool), COUNT_CACHE_TTL_MS),
+              fetchRowsPg(1),
+            ]);
+            rowsPg = rws;
+            page = 1;
+            if (approx != null) {
+              totalPg = approx;
+              countEstimated = true;
+            } else {
+              totalPg = await runCountPg();
+            }
+          } else {
+            const [tr, rws] = await Promise.all([runCountPg(), fetchRowsPg(1)]);
+            totalPg = tr;
+            page = 1;
+            rowsPg = rws;
+          }
+        } else {
+          if (includeTotal) {
+            if (useApproxCount) {
+              totalPg = await getOrLoadMaster(approxCountKey, () => getApproximateSalesRowCount(pool), COUNT_CACHE_TTL_MS);
+              if (totalPg != null) countEstimated = true;
+              else totalPg = await runCountPg();
+            } else {
+              totalPg = await runCountPg();
+            }
+          }
+          let totalPagesForClampPg = maxPageByCap;
+          if (includeTotal && totalPg != null) {
+            totalPagesForClampPg = Math.max(1, Math.ceil(totalPg / limit));
+          }
+          page = Math.min(page, totalPagesForClampPg);
+          rowsPg = await fetchRowsPg(page);
+        }
+
+        let enrichedPg = rowsPg || [];
+        if (!canSkipRuntimeEnrichment(enrichedPg)) {
+          const [partyNameToTypeMap, soTypeMap, partyGroupingMap, agentNameMap, regionMap, partyMasterMap] = await Promise.all([
+            getCustomerTypeMasterMap(),
+            getSoTypeMasterMap(),
+            getPartyGroupingMasterMap(),
+            getAgentNameMasterMap(),
+            getRegionMasterMap(),
+            getPartyMasterAppMap(),
+          ]);
+          enrichedPg = enrichRowsSinglePass(enrichedPg, partyNameToTypeMap, soTypeMap, partyGroupingMap, agentNameMap, regionMap, partyMasterMap);
+        } else {
+          enrichedPg = enrichedPg.filter((row) => !isGrandTotalRow(row));
+        }
+
+        const fallbackTotalPg = ((page - 1) * limit) + (rowsPg?.length || 0);
+        const resolvedTotalPg = includeTotal ? (totalPg == null ? fallbackTotalPg : totalPg) : null;
+        const resolvedTotalPagesPg = includeTotal
+          ? (totalPg == null
+            ? Math.max(1, rowsPg?.length === limit ? page + 1 : page)
+            : (Math.ceil(totalPg / limit) || 1))
+          : Math.max(1, (rowsPg?.length || 0) < limit ? page : page + 1);
+
+        const payloadPg = {
+          data: enrichedPg,
+          pagination: {
+            page,
+            limit,
+            total: resolvedTotalPg,
+            totalPages: resolvedTotalPagesPg,
+            nextCursor: rowsPg && rowsPg.length ? rowsPg[rowsPg.length - 1]?.id ?? null : null,
+            ...(countEstimated ? { countEstimated: true } : {}),
+          },
+        };
+        dataPageCache.set(buildDataCacheKey(page), { ts: Date.now(), payload: payloadPg });
+        while (dataPageCache.size > DATA_PAGE_CACHE_MAX) {
+          const k = dataPageCache.keys().next().value;
+          dataPageCache.delete(k);
+        }
+        res.set('Cache-Control', 'private, max-age=0, must-revalidate');
+        res.set('X-Data-Cache', 'MISS');
+        res.set('X-Data-Source', 'postgres');
+        return res.json(payloadPg);
+      } catch (pgErr) {
+        logError('data', 'getData postgres failed; falling back to supabase', { message: pgErr?.message });
+      }
     }
 
     const runCount = () => getOrLoadMaster(countKey, async () => {
@@ -441,6 +651,7 @@ export async function getData(req, res) {
     }
     res.set('Cache-Control', 'private, max-age=0, must-revalidate');
     res.set('X-Data-Cache', 'MISS');
+    res.set('X-Data-Source', 'supabase');
     res.json(payload);
   } catch (err) {
     res.status(500).json({ error: err.message });

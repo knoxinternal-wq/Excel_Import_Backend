@@ -6,6 +6,7 @@ import { getAgentNameMasterMap } from './masterLoaders.js';
 import {
   isPivotSqlAggregationEligible,
   isPivotSqlDrilldownEligible,
+  getPivotSqlPool,
   queryDistinctPivotFilterValues,
   queryPivotGroupBy,
   queryDrilldownPage,
@@ -50,8 +51,8 @@ function isGrandTotalRow(row) {
   return branch === 'total' || branch === 'grand total' || branch.includes('grand total') || branch.includes('grandtotal');
 }
 
-/** In-process pivot payload cache; default 60s unless overridden. */
-const PIVOT_RESULT_CACHE_TTL_MS = Number(process.env.PIVOT_MEMORY_CACHE_TTL_MS) || 60_000;
+/** In-process pivot payload cache; default 180s (large tables + repeat layouts). */
+const PIVOT_RESULT_CACHE_TTL_MS = Number(process.env.PIVOT_MEMORY_CACHE_TTL_MS) || 180_000;
 const PIVOT_RESULT_CACHE_MAX = 40;
 const pivotResultCache = new Map();
 
@@ -525,7 +526,9 @@ function splitFilters(filters) {
       const vals = Array.isArray(f.values) ? f.values : [];
       const normVals = vals.map(normText).filter(Boolean);
       if (!normVals.length) continue;
-      if (!NUMERIC_FIELDS.has(f.field) && !DATE_FIELDS.has(f.field)) {
+      // Large / comma-containing string IN lists are fine for Postgres (`= ANY($n::text[])`).
+      // Only defer to in-memory when we must use the Supabase stream (no SQL pool).
+      if (!NUMERIC_FIELDS.has(f.field) && !DATE_FIELDS.has(f.field) && !getPivotSqlPool()) {
         if (normVals.length > MAX_SQL_STRING_IN || normVals.some((v) => String(v).includes(','))) {
           memFilters.push(f);
           continue;
@@ -948,10 +951,15 @@ export async function runPivot(config = {}) {
   const { sqlFilters, memFilters } = splitFilters(normalized.filters);
   const metricKeys = values.map((v) => `${v.agg}:${v.field}`);
 
-  if (!isPivotSqlAggregationEligible(normalized, memFilters)) {
-    throw new Error('Unsupported pivot filter shape for SQL aggregation. Use supported operators only.');
-  }
-  const result = await runPivotWithPostgres(normalized, sqlFilters, values, metricKeys);
+  const usePostgresPivot = isPivotSqlAggregationEligible(normalized, memFilters);
+  const result = usePostgresPivot
+    ? await runPivotWithPostgres(normalized, sqlFilters, values, metricKeys)
+    : await runPivotWithStream(normalized, sqlFilters, memFilters, values, metricKeys);
+
+  result.meta = {
+    ...result.meta,
+    engine: usePostgresPivot ? 'postgres' : 'stream',
+  };
 
   try {
     const { _helpers: _discard, ...payload } = result;
@@ -1084,4 +1092,34 @@ export async function getFilterValues(field, search = '', limit = '') {
   }
   distinct.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
   return distinct;
+}
+
+/**
+ * One round-trip for many pivot filter dropdowns (parallel DISTINCT + shared caches / Redis).
+ * @returns {Record<string, { values: string[], error?: string }>}
+ */
+export async function getFilterValuesBatch(rawFields, limit = 500) {
+  const raw = Array.isArray(rawFields) ? rawFields : [];
+  const list = [...new Set(raw.map((f) => String(f || '').trim()).filter(Boolean))];
+  const lim = Math.min(2000, Math.max(50, Number(limit) || 500));
+  if (list.length === 0) throw new Error('No filter fields');
+  if (list.length > 24) throw new Error('Too many fields (max 24 per batch)');
+  const entries = await Promise.all(
+    list.map(async (field) => {
+      if (!SALES_FIELDS.includes(field)) {
+        return [field, { values: [], error: 'Invalid filter field' }];
+      }
+      try {
+        const distinct = await queryDistinctPivotFilterValues(field, '', lim);
+        if (distinct == null) {
+          return [field, { values: [], error: 'Unable to fetch distinct filter values from SQL' }];
+        }
+        distinct.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        return [field, { values: distinct }];
+      } catch (e) {
+        return [field, { values: [], error: e?.message || 'Filter values failed' }];
+      }
+    }),
+  );
+  return Object.fromEntries(entries);
 }

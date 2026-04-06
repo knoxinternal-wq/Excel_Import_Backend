@@ -4,10 +4,8 @@
  * Shows party_grouping_master vs sales_data to_party_name to debug mapping.
  */
 import 'dotenv/config';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../models/supabase.js';
 import { normalizePartyName } from '../utils/normalizeHeader.js';
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.ANON_KEY);
 
 async function main() {
   console.log('=== Party Mapping Diagnostic ===\n');

@@ -6,12 +6,11 @@
  * Table has only 3 columns: TO PARTY NAME, PARTY GROUPED, PARTY NAME FOR COUNT
  */
 import 'dotenv/config';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../models/supabase.js';
 import fs from 'fs';
 import path from 'path';
 
 const csvPath = process.argv[2] || path.join(process.cwd(), 'scripts', 'party-grouping-template.csv');
-const supabase = createClient(process.env.SUPABASE_URL, process.env.ANON_KEY);
 
 function parseCSV(content) {
   const lines = content.split(/\r?\n/).filter((l) => l.trim());

@@ -31,6 +31,27 @@ export function normalizePartyName(name) {
     .toLowerCase();
 }
 
+const UNICODE_SPACE_CHARS = /[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g;
+
+/**
+ * Match key for **both** `customer_type_master.party_name` **and** `sales_data.to_party_name`.
+ * Build the map with this on master rows; look up with this on sales rows — same function, same key.
+ *
+ * Preserves internal spaces and hyphen-adjacent spacing (e.g. `COMPANY -RAXAUL` stays distinct from `COMPANY - RAXAUL`).
+ * NFKC, unicode spaces → ASCII space, unicode dashes → '-', tab/newline → single space (no run collapse),
+ * trim ends only, uppercase for case-insensitive comparison.
+ */
+export function normalizePartyNameForCustomerTypeExact(name) {
+  if (name == null || name === '') return '';
+  let s = String(name).normalize('NFKC');
+  s = s.replace(UNICODE_SPACE_CHARS, ' ');
+  s = s.replace(/[\u2013\u2014\u2015\u2212]/g, '-');
+  s = s.replace(/\t/g, ' ');
+  s = s.replace(/\r\n|\r|\n/g, ' ');
+  s = s.trim();
+  return s.toUpperCase();
+}
+
 /**
  * Return alias keys for party lookup.
  * E.g. master has "M/S ABC TRADERS" → also match when Excel has "ABC TRADERS".

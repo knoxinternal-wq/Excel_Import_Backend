@@ -1,8 +1,26 @@
 import ExcelJS from 'exceljs';
-import { getPivotFields, runPivot, runDrilldown, toDisplayNumber, getFilterValues } from '../services/pivotService.js';
+import {
+  getPivotFields,
+  runPivot,
+  runDrilldown,
+  toDisplayNumber,
+  getFilterValues,
+  getFilterValuesBatch,
+} from '../services/pivotService.js';
 import { applyPivotBodyWindow } from '../services/pivotBodyOrder.js';
+import { isPivotSqlStatementTimeoutError } from '../services/pivotSql.js';
 
 const MAX_PIVOT_BODY_LIMIT = 100_000;
+
+const PIVOT_SQL_TIMEOUT_MESSAGE =
+  'Pivot SQL exceeded the configured time limit. Add filters, use fewer row/column fields, or raise PIVOT_PG_STATEMENT_TIMEOUT_MS on the server.';
+
+function sendPivotSqlErrorResponse(res, err) {
+  if (isPivotSqlStatementTimeoutError(err)) {
+    return res.status(504).json({ error: PIVOT_SQL_TIMEOUT_MESSAGE, code: 'PIVOT_TIMEOUT' });
+  }
+  return res.status(400).json({ error: err.message });
+}
 
 function parsePivotBodyWindow(body) {
   const subtotalFields = Array.isArray(body?.subtotalFields) ? body.subtotalFields : [];
@@ -23,7 +41,6 @@ function stripPivotBodyWindowParams(config) {
   const next = { ...config };
   delete next.bodyOffset;
   delete next.bodyLimit;
-  delete next.subtotalFields;
   return next;
 }
 
@@ -197,7 +214,7 @@ export async function getPivotDataHandler(req, res) {
         : {}),
     });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    sendPivotSqlErrorResponse(res, err);
   }
 }
 
@@ -207,7 +224,7 @@ export async function getPivotDrilldownHandler(req, res) {
     const result = await runDrilldown(config || {}, drill || {});
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    sendPivotSqlErrorResponse(res, err);
   }
 }
 
@@ -295,7 +312,7 @@ export async function exportPivotHandler(req, res) {
     res.setHeader('Content-Disposition', 'attachment; filename="pivot_report.csv"');
     res.send(`\uFEFF${csv}`);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    sendPivotSqlErrorResponse(res, err);
   }
 }
 
@@ -307,7 +324,20 @@ export async function getPivotFilterValuesHandler(req, res) {
     const values = await getFilterValues(field, search, limit);
     res.json({ field, values });
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    sendPivotSqlErrorResponse(res, err);
+  }
+}
+
+/** POST body: `{ fields: string[], limit?: number }` — one round-trip for many pivot filter dropdowns. */
+export async function getPivotFilterValuesBatchHandler(req, res) {
+  try {
+    const raw = req.body?.fields;
+    const fields = Array.isArray(raw) ? raw : [];
+    const limit = req.body?.limit;
+    const batch = await getFilterValuesBatch(fields, limit);
+    res.json({ fields: batch });
+  } catch (err) {
+    sendPivotSqlErrorResponse(res, err);
   }
 }
 
@@ -334,7 +364,7 @@ export async function getPivotQuickHandler(req, res) {
     res.set('Cache-Control', 'private, max-age=30');
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    sendPivotSqlErrorResponse(res, err);
   }
 }
 

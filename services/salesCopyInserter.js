@@ -36,9 +36,19 @@ async function applyImportSessionSettings(client, connectionString, opts = {}) {
       await client.query('SET statement_timeout = 0');
     }
   } catch (e) {
-    logWarn('import', 'SET statement_timeout failed (COPY may still hit server timeout)', {
+    logError('import', 'SET statement_timeout failed — COPY may hit DB default timeout', {
       message: e?.message,
     });
+  }
+  try {
+    await client.query('SET lock_timeout = 0');
+  } catch (e) {
+    logWarn('import', 'SET lock_timeout failed', { message: e?.message });
+  }
+  try {
+    await client.query('SET idle_in_transaction_session_timeout = 0');
+  } catch {
+    /* PG < 14 or permission */
   }
   try {
     await client.query('SET jit = off');
@@ -230,7 +240,7 @@ export class SalesCopyWriter {
     this._lineBatchBytes = 0;
     this._rowsInBatch = 0;
     const envRows = Number(process.env.IMPORT_COPY_ROW_BATCH);
-    this._rowBatchThreshold = Number.isFinite(envRows) && envRows >= 1 ? Math.floor(envRows) : 10_000;
+    this._rowBatchThreshold = Number.isFinite(envRows) && envRows >= 1 ? Math.floor(envRows) : 25_000;
     const envBuf = Number(process.env.IMPORT_COPY_BUFFER_BYTES);
     this._flushThreshold = Number.isFinite(envBuf) && envBuf >= 65536 ? envBuf : 64 * 1024 * 1024;
     this._tempVals = new Array(SALES_COPY_COLUMNS.length);

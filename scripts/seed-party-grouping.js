@@ -9,17 +9,7 @@
  * Otherwise: party_grouped = party_name_for_count = to_party_name
  */
 import 'dotenv/config';
-import { createClient } from '@supabase/supabase-js';
-
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseAnonKey = process.env.ANON_KEY;
-
-if (!supabaseUrl || !supabaseAnonKey) {
-  console.error('ERROR: Missing SUPABASE_URL or ANON_KEY in .env');
-  process.exit(1);
-}
-
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+import { supabase } from '../models/supabase.js';
 
 function derivePartyGrouped(fullName) {
   const s = String(fullName || '').trim();

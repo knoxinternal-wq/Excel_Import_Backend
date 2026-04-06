@@ -5,6 +5,9 @@ export const MAX_SALES_ROWS = 2_500_000;
 export const SKIP_ROWS = 2;
 export const SKIP_COLUMN_A = true;
 
+/** Defer one row while streaming; drop the final data row per sheet (totals/footer row). */
+export const SKIP_LAST_DATA_ROW = true;
+
 /** Keywords that identify a grand total row - filter at display time (case-insensitive) */
 export const GRAND_TOTAL_ROW_PATTERNS = ['grand total', 'grandtotal', 'total'];
 

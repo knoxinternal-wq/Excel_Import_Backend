@@ -24,6 +24,44 @@ export function assertDatabaseUrl() {
   return url;
 }
 
+/**
+ * HTTPS base URL for `@supabase/supabase-js` (PostgREST). Used with ANON_KEY for REST reads/writes.
+ * Order: `SUPABASE_URL` if set, else derive from `DATABASE_URL` when it is a Supabase Postgres URI:
+ * - host `db.<project_ref>.supabase.co`, or
+ * - `*.pooler.supabase.com` with username `postgres.<project_ref>`.
+ * Non-Supabase DATABASE_URL → return '' (then set SUPABASE_URL explicitly).
+ * @returns {string}
+ */
+export function getSupabaseHttpUrl() {
+  const explicit = String(process.env.SUPABASE_URL || '').trim();
+  if (explicit) return explicit.replace(/\/+$/, '');
+
+  const dbUrl = getDatabaseUrl();
+  if (!dbUrl) return '';
+
+  try {
+    const normalized = dbUrl.replace(/^postgres:\/\//i, 'postgresql://');
+    const u = new URL(normalized);
+    const host = u.hostname || '';
+
+    const direct = host.match(/^db\.([^.]+)\.supabase\.co$/i);
+    if (direct) {
+      return `https://${direct[1]}.supabase.co`;
+    }
+
+    if (/pooler\.supabase\.com$/i.test(host)) {
+      const rawUser = u.username ? decodeURIComponent(u.username) : '';
+      const poolerUser = rawUser.match(/^postgres\.([^.]+)$/i);
+      if (poolerUser) {
+        return `https://${poolerUser[1]}.supabase.co`;
+      }
+    }
+  } catch {
+    /* ignore parse errors */
+  }
+  return '';
+}
+
 function keepAliveInitialDelayMillis() {
   const n = Number(process.env.IMPORT_PG_KEEPALIVE_MS);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 10_000;

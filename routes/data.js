@@ -10,6 +10,7 @@ import { getReportMeta } from '../controllers/reportController.js';
 import {
   getPivotFieldsHandler,
   getPivotFilterValuesHandler,
+  getPivotFilterValuesBatchHandler,
   getPivotDataHandler,
   getPivotQuickHandler,
   getPivotDrilldownHandler,
@@ -26,6 +27,7 @@ router.delete('/delete-range', deleteByDateRange);
 router.get('/report/meta', getReportMeta);
 router.get('/report/fields', getPivotFieldsHandler);
 router.get('/report/filter-values', getPivotFilterValuesHandler);
+router.post('/report/filter-values-batch', getPivotFilterValuesBatchHandler);
 router.post('/report/pivot', getPivotDataHandler);
 router.get('/pivot', getPivotQuickHandler);
 router.post('/report/drilldown', getPivotDrilldownHandler);

@@ -9,6 +9,7 @@
     "dev": "node --watch server.js",
     "db:migrate": "node scripts/migrate.js",
     "db:verify": "node scripts/verify-db.js",
+    "db:diagnose-party-master": "node scripts/diagnose-party-master-app.mjs",
     "db:seed": "node scripts/seed-party-grouping.js",
     "db:import-party-grouping": "node scripts/import-party-grouping.js",
     "db:backfill-so-type": "node scripts/backfill-so-type.js",

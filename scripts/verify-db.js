@@ -4,17 +4,7 @@
  * Verifies that Excel import data can be written to and read from the database.
  */
 import 'dotenv/config';
-import { createClient } from '@supabase/supabase-js';
-
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseAnonKey = process.env.ANON_KEY;
-
-if (!supabaseUrl || !supabaseAnonKey) {
-  console.error('ERROR: Missing SUPABASE_URL or ANON_KEY in .env');
-  process.exit(1);
-}
-
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+import { supabase } from '../models/supabase.js';
 
 async function verify() {
   console.log('=== Database Verification ===\n');
@@ -47,6 +37,23 @@ async function verify() {
     console.warn('   WARNING: party_grouping_master is empty. Populate it for party_grouped/party_name_for_count mapping.');
     console.warn('   Without it, import will use TO PARTY NAME as fallback for both columns.');
     console.warn('   Example: INSERT INTO party_grouping_master (to_party_name, party_grouped, party_name_for_count) VALUES (\'ABC TRADERS\', \'ABC GROUP\', \'ABC TRADERS\');');
+  }
+  console.log('');
+
+  // 1c. party_master_app (district + pin_code from TO PARTY NAME)
+  console.log('1c. Checking party_master_app (district / PIN CODE master)...');
+  const { count: partyCount, error: partyErr } = await supabase
+    .from('party_master_app')
+    .select('*', { count: 'exact', head: true });
+  if (partyErr) {
+    console.error('   FAILED (anon REST):', partyErr.message);
+    console.error('   → With DATABASE_URL set, the app still loads this table via Postgres; otherwise add RLS SELECT for anon or run: npm run db:diagnose-party-master');
+  } else {
+    console.log(`   anon REST row count: ${partyCount ?? 0}`);
+    if ((partyCount ?? 0) === 0) {
+      console.warn('   If the table has data in SQL Editor but count is 0 here, RLS is blocking anon.');
+      console.warn('   Run: npm run db:diagnose-party-master');
+    }
   }
   console.log('');
 

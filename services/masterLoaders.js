@@ -10,12 +10,12 @@ import { loadSoTypeMasterMap } from '../utils/soTypeMaster.js';
 import { getOrLoadMaster, invalidateMasterCache } from './masterLookupCache.js';
 import { logWarn } from '../utils/logger.js';
 
-const KEY_CUSTOMER_TYPE = 'master:customer_type_map_v1';
+const KEY_CUSTOMER_TYPE = 'master:customer_type_map_v2';
 const KEY_SO_TYPE = 'master:so_type_map_v1';
-const KEY_PARTY_GROUPING = 'master:party_grouping_map_v1';
+const KEY_PARTY_GROUPING = 'master:party_grouping_map_v2';
 const KEY_AGENT_NAME = 'master:agent_name_map_v1';
 const KEY_REGION = 'master:region_map_v1';
-const KEY_PARTY_MASTER_APP = 'master:party_master_app_v1';
+const KEY_PARTY_MASTER_APP = 'master:party_master_app_v2';
 const KEY_PARTY_GROUPING_SEARCH_ROWS = 'master:party_grouping_search_rows_v1';
 
 async function loadCustomerTypeMapUncached() {
@@ -23,11 +23,24 @@ async function loadCustomerTypeMapUncached() {
   // 1) normalized columns: party_name, type
   // 2) Excel-style quoted columns: "PARTY NAME", "TYPE"
   const { data, error } = await supabase.from('customer_type_master').select('*');
-  if (error) {
-    logWarn('masterLoaders', 'customer_type_master load failed', { error: error.message });
-    return new Map();
+  if (!error && data?.length > 0) {
+    return buildCustomerTypeMasterMap(data);
   }
-  return buildCustomerTypeMasterMap(data);
+  if (error) {
+    logWarn('masterLoaders', 'customer_type_master supabase load failed', { error: error.message });
+  }
+  const pool = getPgPool();
+  if (pool) {
+    try {
+      const r = await pool.query('SELECT * FROM customer_type_master');
+      if (r.rows?.length > 0) {
+        return buildCustomerTypeMasterMap(r.rows);
+      }
+    } catch (e) {
+      logWarn('masterLoaders', 'customer_type_master postgres read failed', { error: e?.message || String(e) });
+    }
+  }
+  return buildCustomerTypeMasterMap(data || []);
 }
 
 export function getCustomerTypeMasterMap() {
@@ -89,6 +102,12 @@ export function getAgentNameMasterMap() {
   return getOrLoadMaster(KEY_AGENT_NAME, loadAgentNameMapUncached);
 }
 
+function trimOrNull(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s === '' ? null : s;
+}
+
 async function loadPartyGroupingMapUncached() {
   const map = new Map();
   const getMasterToPartyName = (row) => (
@@ -105,23 +124,33 @@ async function loadPartyGroupingMapUncached() {
   const getMasterPartyNameForCount = (row) => (
     row?.['PARTY NAME FOR COUNT']
     ?? row?.party_name_for_count
+    ?? row?.party_name_for_cnt
     ?? null
   );
   const value = (row) => ({
-    party_grouped: getMasterPartyGrouped(row),
-    party_name_for_count: getMasterPartyNameForCount(row),
+    party_grouped: trimOrNull(getMasterPartyGrouped(row)),
+    party_name_for_count: trimOrNull(getMasterPartyNameForCount(row)),
   });
   const addKey = (raw, row) => {
     if (raw == null || String(raw).trim() === '') return;
     const key = normalizePartyName(raw);
     if (!key) return;
-    map.set(key, value(row));
+    const v = value(row);
+    map.set(key, v);
     for (const alt of getPartyNameAliasKeys(String(raw))) {
-      if (alt && !map.has(alt)) map.set(alt, value(row));
+      if (alt && !map.has(alt)) map.set(alt, v);
     }
   };
+  const ingestRows = (rows) => {
+    for (const row of rows || []) {
+      const tp = getMasterToPartyName(row);
+      if (tp) addKey(tp, row);
+    }
+  };
+
   const pageSize = 1000;
   let from = 0;
+  let supabaseFailed = false;
   for (;;) {
     const to = from + pageSize - 1;
     const { data, error } = await supabase
@@ -129,16 +158,35 @@ async function loadPartyGroupingMapUncached() {
       .select('to_party_name, party_grouped, party_name_for_count')
       .range(from, to);
     if (error) {
-      logWarn('masterLoaders', 'party_grouping_master load failed', { error: error.message });
-      return new Map();
+      logWarn('masterLoaders', 'party_grouping_master supabase load failed', { error: error.message });
+      supabaseFailed = true;
+      map.clear();
+      break;
     }
-    for (const row of data || []) {
-      const tp = getMasterToPartyName(row);
-      if (tp) addKey(tp, row);
-    }
+    ingestRows(data);
     if (!data || data.length < pageSize) break;
     from += pageSize;
   }
+
+  if (map.size === 0 || supabaseFailed) {
+    const pool = getPgPool();
+    if (pool) {
+      try {
+        const r = await pool.query(
+          'SELECT to_party_name, party_grouped, party_name_for_count FROM party_grouping_master',
+        );
+        if (r.rows?.length > 0) {
+          map.clear();
+          ingestRows(r.rows);
+        }
+      } catch (e) {
+        logWarn('masterLoaders', 'party_grouping_master postgres read failed', {
+          error: e?.message || String(e),
+        });
+      }
+    }
+  }
+
   return map;
 }
 
@@ -203,7 +251,68 @@ export function getRegionMasterMap() {
   return getOrLoadMaster(KEY_REGION, loadRegionMasterMapUncached);
 }
 
+/**
+ * party_master_app columns vary by migration (quoted UPPER vs snake_case). PostgREST may return either.
+ * @param {Record<string, unknown>} row
+ * @returns {{ accountName: string, districtVal: string, pinCodeVal: string }}
+ */
+function pickPartyMasterFields(row) {
+  if (!row || typeof row !== 'object') {
+    return { accountName: '', districtVal: '', pinCodeVal: '' };
+  }
+  const firstNonEmpty = (keys) => {
+    for (const k of keys) {
+      if (row[k] == null) continue;
+      const s = String(row[k]).trim();
+      if (s !== '') return s;
+    }
+    return '';
+  };
+  return {
+    accountName: firstNonEmpty(['ACCOUNT_NAME', 'account_name', 'Account_Name']),
+    districtVal: firstNonEmpty(['DISTRICT', 'district']),
+    pinCodeVal: firstNonEmpty(['PIN_CODE', 'pin_code', 'Pin_Code', 'PIN CODE']),
+  };
+}
+
+function buildPartyMasterMapFromRows(rows) {
+  const map = new Map();
+  for (const row of rows || []) {
+    const { accountName, districtVal, pinCodeVal } = pickPartyMasterFields(row);
+    if (!accountName) continue;
+    const district = districtVal || null;
+    const pin_code = pinCodeVal || null;
+    const key = normalizePartyName(accountName);
+    if (!map.has(key)) map.set(key, { district, pin_code });
+    for (const alt of getPartyNameAliasKeys(accountName)) {
+      if (alt && !map.has(alt)) map.set(alt, { district, pin_code });
+    }
+  }
+  return map;
+}
+
 async function loadPartyMasterMapUncached() {
+  const pool = getPgPool();
+  if (pool) {
+    try {
+      const r = await pool.query('SELECT * FROM party_master_app');
+      const rowCount = r.rows?.length ?? 0;
+      if (rowCount > 0) {
+        const map = buildPartyMasterMapFromRows(r.rows);
+        if (map.size === 0) {
+          logWarn('masterLoaders', 'party_master_app: rows in DB but no ACCOUNT_NAME/account_name on rows', {
+            sampleKeys: r.rows[0] ? Object.keys(r.rows[0]) : [],
+            rowCount,
+          });
+        } else {
+          return map;
+        }
+      }
+    } catch (e) {
+      logWarn('masterLoaders', 'party_master_app postgres read failed', { error: e?.message || String(e) });
+    }
+  }
+
   const map = new Map();
   const pageSize = 1000;
   let from = 0;
@@ -211,26 +320,27 @@ async function loadPartyMasterMapUncached() {
     const to = from + pageSize - 1;
     const { data, error } = await supabase
       .from('party_master_app')
-      .select('ACCOUNT_NAME, DISTRICT, PIN_CODE')
+      .select('*')
       .range(from, to);
     if (error) {
-      logWarn('masterLoaders', 'party_master_app load failed', { error: error.message });
+      logWarn('masterLoaders', 'party_master_app supabase load failed', { error: error.message });
       return new Map();
     }
     for (const row of data || []) {
-      const accountName = row?.ACCOUNT_NAME != null ? String(row.ACCOUNT_NAME).trim() : '';
-      const districtVal = row?.DISTRICT != null ? String(row.DISTRICT).trim() : '';
-      const pinCodeVal = row?.PIN_CODE != null ? String(row.PIN_CODE).trim() : '';
+      const { accountName, districtVal, pinCodeVal } = pickPartyMasterFields(row);
       if (!accountName) continue;
+      const district = districtVal || null;
+      const pin_code = pinCodeVal || null;
       const key = normalizePartyName(accountName);
-      if (!map.has(key)) map.set(key, { district: districtVal || null, pin_code: pinCodeVal || null });
+      if (!map.has(key)) map.set(key, { district, pin_code });
       for (const alt of getPartyNameAliasKeys(accountName)) {
-        if (alt && !map.has(alt)) map.set(alt, { district: districtVal || null, pin_code: pinCodeVal || null });
+        if (alt && !map.has(alt)) map.set(alt, { district, pin_code });
       }
     }
     if (!data || data.length < pageSize) break;
     from += pageSize;
   }
+
   return map;
 }
 

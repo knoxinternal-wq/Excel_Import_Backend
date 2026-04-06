@@ -2,7 +2,7 @@
  * Node-side enrichment for sales_data rows (replaces SQL joins + CASE in transformStagingToFact).
  */
 import { normalizePartyName, getPartyNameAliasKeys, normalizeAgentName, getAgentNameExactKey } from '../../utils/normalizeHeader.js';
-import { resolveBusinessType } from '../../utils/customerTypeMaster.js';
+import { resolveBusinessType, normalizeBusinessTypeText } from '../../utils/customerTypeMaster.js';
 import { resolveSoType } from '../../utils/soTypeMaster.js';
 
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -132,6 +132,16 @@ function deriveDistrictAndPinCodeFromToPartyName(data, partyMasterMap) {
   if (match?.pin_code) data.pin_code = match.pin_code;
 }
 
+/** First trimmed non-empty string, else null (`??` does not treat '' as missing). */
+function firstNonBlank(...vals) {
+  for (const v of vals) {
+    if (v == null) continue;
+    const s = String(v).trim();
+    if (s !== '') return s;
+  }
+  return null;
+}
+
 function derivePartyGrouping(data, partyGroupingMap) {
   const toPartyName = data.to_party_name;
   const excelPartyGrouped = data.party_grouped;
@@ -139,8 +149,8 @@ function derivePartyGrouping(data, partyGroupingMap) {
   const toPartyTrimmed = toPartyName != null && String(toPartyName).trim() !== '' ? String(toPartyName).trim() : null;
 
   if (!toPartyTrimmed) {
-    data.party_grouped = excelPartyGrouped ?? null;
-    data.party_name_for_count = excelPartyNameForCount ?? null;
+    data.party_grouped = firstNonBlank(excelPartyGrouped);
+    data.party_name_for_count = firstNonBlank(excelPartyNameForCount);
     return;
   }
 
@@ -154,10 +164,14 @@ function derivePartyGrouping(data, partyGroupingMap) {
   }
 
   if (master) {
-    data.party_name_for_count = master.party_name_for_count ?? toPartyTrimmed;
-    data.party_grouped = master.party_grouped ?? toPartyTrimmed;
+    data.party_name_for_count = firstNonBlank(
+      master.party_name_for_count,
+      excelPartyNameForCount,
+      toPartyTrimmed,
+    );
+    data.party_grouped = firstNonBlank(master.party_grouped, excelPartyGrouped, toPartyTrimmed);
   } else {
-    data.party_name_for_count = excelPartyNameForCount ?? toPartyTrimmed;
+    data.party_name_for_count = firstNonBlank(excelPartyNameForCount, toPartyTrimmed);
     // Business rule: if no party_grouping_master match, party_grouped should mirror TO PARTY NAME.
     data.party_grouped = toPartyTrimmed;
   }
@@ -187,14 +201,15 @@ function deriveItemWithShade(data) {
 
 /**
  * TYPE OF Business (`business_type`):
- * - Match `sales_data.to_party_name` to `customer_type_master.party_name` (via normalized map built from that table).
- * - Use `customer_type_master.type` (column may appear as `type` / `TYPE` from PostgREST).
- * - If no row matches, use RETAILER only (see `resolveBusinessType`).
- * - Excel "TYPE OF Business" is not imported; this is the sole source during ingest.
- * - ITALIAN CHANNEL + RETAILER → DISTRIBUTOR (existing business rule).
+ * 1) Excel column "TYPE OF Business" → `business_type` when non-empty (after trim / line-break cleanup).
+ * 2) Else match `to_party_name` to `customer_type_master` (same normalizer as master; M/S prefix variants).
+ * 3) Else default RETAILER (`resolveBusinessType`).
+ * ITALIAN CHANNEL + RETAILER → DISTRIBUTOR (existing business rule).
  */
 function applyBusinessTypeAndItalianChannel(data, customerTypeByParty) {
-  const resolved = resolveBusinessType(data.to_party_name, customerTypeByParty);
+  const fromExcel = normalizeBusinessTypeText(data.business_type);
+  const fromMaster = resolveBusinessType(data.to_party_name, customerTypeByParty);
+  const resolved = fromExcel !== '' ? fromExcel : fromMaster;
   const branchForRule = data?.branch != null ? String(data.branch).trim().toUpperCase() : '';
   const typeForRule = String(resolved || '').trim().toUpperCase();
   if (branchForRule === 'ITALIAN CHANNEL' && typeForRule === 'RETAILER') {

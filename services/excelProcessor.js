@@ -7,8 +7,8 @@ import { normalizeHeader } from '../utils/normalizeHeader.js';
 import { v4 as uuidv4 } from 'uuid';
 import { supabase } from '../models/supabase.js';
 import {
-  SKIP_ROWS,
   SKIP_COLUMN_A,
+  SKIP_LAST_DATA_ROW,
   REQUIRED_HEADERS,
   NUMERIC_FIELDS,
   DATE_FIELDS,
@@ -289,7 +289,14 @@ function buildColumnPlan(headerIndices) {
       continue;
     }
     const idx = headerIndices[excelHeader];
-    if (idx === undefined) continue;
+    if (idx === undefined) {
+      // Always reset these per row so derivePartyGrouping sees null (not a stale value from the previous row).
+      if (dbCol === 'party_grouped' || dbCol === 'party_name_for_count') {
+        outCols.add(dbCol);
+        plan.push({ k: 'null', dbCol });
+      }
+      continue;
+    }
     outCols.add(dbCol);
     if (NUMERIC_FIELDS_SET.has(excelHeader)) {
       plan.push({
@@ -427,10 +434,24 @@ const JOB_UPDATE_EVERY_N_ROWS =
     ? Math.max(5000, Math.floor(Number(process.env.IMPORT_JOB_UPDATE_EVERY_ROWS)))
     : 100_000;
 
+/** Parallel CSV shards + concurrent COPY sessions (import tab only). Set to 1 to use single-stream COPY. */
 const IMPORT_COPY_PARALLEL =
   Number(process.env.IMPORT_COPY_PARALLEL) > 0
     ? Math.min(8, Math.max(1, Math.floor(Number(process.env.IMPORT_COPY_PARALLEL))))
     : 4;
+
+/**
+ * When true (default): single COPY stream only — if import fails, Postgres rolls back that COPY (no partial rows).
+ * Set IMPORT_ATOMIC=0 to allow parallel shards (faster; a shard failure can leave rows from other shards committed).
+ */
+function importAtomicEnabled() {
+  return String(process.env.IMPORT_ATOMIC ?? '1').trim() !== '0';
+}
+
+function useParallelShardImport() {
+  if (importAtomicEnabled()) return false;
+  return Boolean(getPgPool()) && IMPORT_COPY_PARALLEL >= 2;
+}
 const SUPABASE_IMPORT_BATCH_SIZE =
   Number(process.env.IMPORT_SUPABASE_BATCH_SIZE) > 0
     ? Math.min(2000, Math.floor(Number(process.env.IMPORT_SUPABASE_BATCH_SIZE)))
@@ -625,9 +646,12 @@ async function streamExcelToCsvShards({
   importProcessedBaseline,
 }) {
   const tmpDir = path.join(path.dirname(filePath), 'import-tmp', job.jobId);
+  /** @type {import('fs').WriteStream[]} */
+  let streams = [];
+  let shardPaths = [];
   await fs.promises.mkdir(tmpDir, { recursive: true });
-  const shardPaths = Array.from({ length: numShards }, (_, i) => path.join(tmpDir, `part-${i}.csv`));
-  const streams = shardPaths.map((p) =>
+  shardPaths = Array.from({ length: numShards }, (_, i) => path.join(tmpDir, `part-${i}.csv`));
+  streams = shardPaths.map((p) =>
     fs.createWriteStream(p, { flags: 'w', highWaterMark: 4 * 1024 * 1024 }),
   );
 
@@ -637,12 +661,51 @@ async function streamExcelToCsvShards({
   let csvRowsWritten = 0;
   let rowsSinceCancelCheck = 0;
   let rowsSinceStreamPersist = 0;
+  let streamOk = false;
+  /** When SKIP_LAST_DATA_ROW: hold one data row until the next arrives; final row per workbook is dropped after the loop. */
+  let pendingRowArray = null;
+  let pendingRowNumber = null;
 
   try {
     await writeShardChunk(
       streams[0],
       `${CSV_IMPORT_HEADERS.map(escapeCsvField).join(',')}\n`,
     );
+
+    const flushPendingShardRow = async () => {
+      if (pendingRowArray == null || !columnPlanStruct) return;
+      const fromRowArray = pendingRowArray;
+      const fromRowNumber = pendingRowNumber;
+      pendingRowArray = null;
+      pendingRowNumber = null;
+      validateRowInto(fromRowArray, columnPlanStruct, rowDataOut);
+      const out = { ...rowDataOut };
+      const built = tryBuildCopyCsvLine(out);
+      if (!built.ok) {
+        job.failedRows += 1;
+        errorBuffer.push({
+          rowNumber: fromRowNumber,
+          rowData: slimRowForErrorLog(out),
+          errorMessage: built.message || 'Invalid row for COPY',
+        });
+      } else {
+        const shardIdx = csvRowsWritten % numShards;
+        await writeShardChunk(streams[shardIdx], `${fromRowNumber},${built.line}\n`);
+        csvRowsWritten += 1;
+        job.checkpointRow = fromRowNumber;
+      }
+      if (errorBuffer.length >= ERROR_BATCH_SIZE) {
+        const toInsert = errorBuffer.splice(0, errorBuffer.length);
+        await saveErrorRows(job.jobId, toInsert);
+      }
+      if (rowsSinceStreamPersist >= JOB_UPDATE_EVERY_N_ROWS) {
+        rowsSinceStreamPersist = 0;
+        job.processedRows = importProcessedBaseline;
+        const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 1);
+        job.throughputRps = Number((totalDataRowsSeen / elapsedSec).toFixed(2));
+        await updateJobInDb(job.jobId, job);
+      }
+    };
 
     const workbook = new ExcelJS.stream.xlsx.WorkbookReader(filePath, {
       sharedStrings: 'cache',
@@ -652,6 +715,8 @@ async function streamExcelToCsvShards({
     });
 
     outer: for await (const worksheetReader of workbook) {
+      pendingRowArray = null;
+      pendingRowNumber = null;
       const sharedStrings = workbook.sharedStrings || worksheetReader.workbook?.sharedStrings;
       let headerValidated = false;
       let headerAttemptCount = 0;
@@ -662,6 +727,7 @@ async function streamExcelToCsvShards({
           rowsSinceCancelCheck = 0;
           if (await isJobCancelled(job.jobId)) {
             job.cancelled = true;
+            await flushPendingShardRow();
             break outer;
           }
         }
@@ -691,49 +757,73 @@ async function streamExcelToCsvShards({
 
         rowsSinceStreamPersist += 1;
 
-        if (csvRowsWritten >= MAX_SALES_ROWS) {
-          job.importCapped = true;
-          break outer;
-        }
-
-        validateRowInto(rowArray, columnPlanStruct, rowDataOut);
-        const out = { ...rowDataOut };
-
-        const built = tryBuildCopyCsvLine(out);
-        if (!built.ok) {
-          job.failedRows += 1;
-          errorBuffer.push({
-            rowNumber,
-            rowData: slimRowForErrorLog(out),
-            errorMessage: built.message || 'Invalid row for COPY',
-          });
+        if (SKIP_LAST_DATA_ROW) {
+          if (pendingRowArray !== null) {
+            if (csvRowsWritten >= MAX_SALES_ROWS) {
+              job.importCapped = true;
+              pendingRowArray = null;
+              pendingRowNumber = null;
+              break outer;
+            }
+            await flushPendingShardRow();
+          }
+          if (csvRowsWritten >= MAX_SALES_ROWS) {
+            job.importCapped = true;
+            pendingRowArray = null;
+            pendingRowNumber = null;
+            break outer;
+          }
+          pendingRowArray = rowArray;
+          pendingRowNumber = rowNumber;
         } else {
-          const shardIdx = csvRowsWritten % numShards;
-          await writeShardChunk(streams[shardIdx], `${rowNumber},${built.line}\n`);
-          csvRowsWritten += 1;
-          job.checkpointRow = rowNumber;
-        }
+          if (csvRowsWritten >= MAX_SALES_ROWS) {
+            job.importCapped = true;
+            break outer;
+          }
 
-        if (errorBuffer.length >= ERROR_BATCH_SIZE) {
-          const toInsert = errorBuffer.splice(0, errorBuffer.length);
-          await saveErrorRows(job.jobId, toInsert);
-        }
+          validateRowInto(rowArray, columnPlanStruct, rowDataOut);
+          const out = { ...rowDataOut };
 
-        if (rowsSinceStreamPersist >= JOB_UPDATE_EVERY_N_ROWS) {
-          rowsSinceStreamPersist = 0;
-          job.processedRows = importProcessedBaseline;
-          const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 1);
-          job.throughputRps = Number((totalDataRowsSeen / elapsedSec).toFixed(2));
-          await updateJobInDb(job.jobId, job);
+          const built = tryBuildCopyCsvLine(out);
+          if (!built.ok) {
+            job.failedRows += 1;
+            errorBuffer.push({
+              rowNumber,
+              rowData: slimRowForErrorLog(out),
+              errorMessage: built.message || 'Invalid row for COPY',
+            });
+          } else {
+            const shardIdx = csvRowsWritten % numShards;
+            await writeShardChunk(streams[shardIdx], `${rowNumber},${built.line}\n`);
+            csvRowsWritten += 1;
+            job.checkpointRow = rowNumber;
+          }
+
+          if (errorBuffer.length >= ERROR_BATCH_SIZE) {
+            const toInsert = errorBuffer.splice(0, errorBuffer.length);
+            await saveErrorRows(job.jobId, toInsert);
+          }
+
+          if (rowsSinceStreamPersist >= JOB_UPDATE_EVERY_N_ROWS) {
+            rowsSinceStreamPersist = 0;
+            job.processedRows = importProcessedBaseline;
+            const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 1);
+            job.throughputRps = Number((totalDataRowsSeen / elapsedSec).toFixed(2));
+            await updateJobInDb(job.jobId, job);
+          }
         }
       }
     }
+
+    pendingRowArray = null;
+    pendingRowNumber = null;
 
     job.processedRows = importProcessedBaseline;
     const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 1);
     job.throughputRps = Number((totalDataRowsSeen / elapsedSec).toFixed(2));
     await updateJobInDb(job.jobId, job);
 
+    streamOk = true;
     return { shardPaths, tmpDir, totalDataRowsSeen, csvRowsWritten };
   } finally {
     for (const s of streams) {
@@ -750,7 +840,85 @@ async function streamExcelToCsvShards({
         }),
       ),
     );
+    if (!streamOk) {
+      await fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {
+        /* ignore */
+      });
+    }
   }
+}
+
+/**
+ * Import path for the import tab: parallel shard CSVs + concurrent COPY (when pool exists and IMPORT_COPY_PARALLEL>=2),
+ * otherwise single Excel stream + one COPY (same enrichment / validation logic).
+ */
+async function importExcelForQueuedJob({
+  job,
+  filePath,
+  checkpointStart,
+  errorBuffer,
+  startedAtMs,
+  importProcessedBaseline,
+  masters,
+}) {
+  if (!useParallelShardImport()) {
+    return importExcelDirectToSalesData({
+      job,
+      filePath,
+      checkpointStart,
+      errorBuffer,
+      startedAtMs,
+      importProcessedBaseline,
+      masters,
+    });
+  }
+
+  logInfo('import', 'using parallel CSV shards + COPY', { shards: IMPORT_COPY_PARALLEL, jobId: job.jobId });
+  const streamResult = await streamExcelToCsvShards({
+    job,
+    filePath,
+    checkpointStart,
+    numShards: IMPORT_COPY_PARALLEL,
+    errorBuffer,
+    startedAtMs,
+    importProcessedBaseline,
+  });
+
+  if (job.cancelled || streamResult.csvRowsWritten === 0) {
+    await fs.promises.rm(streamResult.tmpDir, { recursive: true, force: true }).catch(() => {
+      /* ignore */
+    });
+    return {
+      totalDataRowsSeen: streamResult.totalDataRowsSeen,
+      rowsWritten: 0,
+    };
+  }
+
+  try {
+    await importSalesDataFromCsvShards({
+      shardPaths: streamResult.shardPaths,
+      job,
+      masters,
+      isJobCancelled,
+      updateJobInDb,
+      jobUpdateEveryRows: JOB_UPDATE_EVERY_N_ROWS,
+      saveErrorRows,
+      errorBatchSize: ERROR_BATCH_SIZE,
+      startedAtMs,
+      processedRowsBaseline: importProcessedBaseline,
+      failedRowsBaseline: job.failedRows,
+    });
+  } finally {
+    await fs.promises.rm(streamResult.tmpDir, { recursive: true, force: true }).catch(() => {
+      /* ignore */
+    });
+  }
+
+  const rowsWritten = Math.max(0, Number(job.processedRows || 0) - importProcessedBaseline);
+  return {
+    totalDataRowsSeen: streamResult.totalDataRowsSeen,
+    rowsWritten,
+  };
 }
 
 async function importExcelDirectToSalesData({
@@ -768,8 +936,53 @@ async function importExcelDirectToSalesData({
   let rowsWritten = 0;
   let rowsSinceCancelCheck = 0;
   let rowsSincePersist = 0;
+  let pendingRowArray = null;
+  let pendingRowNumber = null;
 
   await withSalesCopyImport(async (writer) => {
+    const flushPendingDirectRow = async () => {
+      if (pendingRowArray == null || !columnPlanStruct) return;
+      const fromRowArray = pendingRowArray;
+      const fromRowNumber = pendingRowNumber;
+      pendingRowArray = null;
+      pendingRowNumber = null;
+      validateRowInto(fromRowArray, columnPlanStruct, rowDataOut);
+      try {
+        enrichImportFactRow(rowDataOut, masters);
+        const writeResult = writer.appendRow(rowDataOut);
+        if (!writeResult.written) {
+          job.failedRows += 1;
+          errorBuffer.push({
+            rowNumber: fromRowNumber,
+            rowData: slimRowForErrorLog(rowDataOut),
+            errorMessage: writeResult.skipMessage || 'Row skipped for COPY',
+          });
+        } else {
+          rowsWritten += 1;
+          job.checkpointRow = fromRowNumber;
+          if (writeResult.flushPromise) await writeResult.flushPromise;
+        }
+      } catch (e) {
+        job.failedRows += 1;
+        errorBuffer.push({
+          rowNumber: fromRowNumber,
+          rowData: slimRowForErrorLog(rowDataOut),
+          errorMessage: e?.message || String(e),
+        });
+      }
+      if (errorBuffer.length >= ERROR_BATCH_SIZE) {
+        const toInsert = errorBuffer.splice(0, errorBuffer.length);
+        await saveErrorRows(job.jobId, toInsert);
+      }
+      if (rowsSincePersist >= JOB_UPDATE_EVERY_N_ROWS) {
+        rowsSincePersist = 0;
+        job.processedRows = importProcessedBaseline + rowsWritten;
+        const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 1);
+        job.throughputRps = Number((job.processedRows / elapsedSec).toFixed(2));
+        await updateJobInDb(job.jobId, job);
+      }
+    };
+
     const workbook = new ExcelJS.stream.xlsx.WorkbookReader(filePath, {
       sharedStrings: 'cache',
       worksheets: 'emit',
@@ -778,6 +991,8 @@ async function importExcelDirectToSalesData({
     });
 
     outer: for await (const worksheetReader of workbook) {
+      pendingRowArray = null;
+      pendingRowNumber = null;
       const sharedStrings = workbook.sharedStrings || worksheetReader.workbook?.sharedStrings;
       let headerValidated = false;
       let headerAttemptCount = 0;
@@ -788,6 +1003,7 @@ async function importExcelDirectToSalesData({
           rowsSinceCancelCheck = 0;
           if (await isJobCancelled(job.jobId)) {
             job.cancelled = true;
+            await flushPendingDirectRow();
             break outer;
           }
         }
@@ -818,51 +1034,74 @@ async function importExcelDirectToSalesData({
 
         rowsSincePersist += 1;
 
-        if (rowsWritten >= MAX_SALES_ROWS) {
-          job.importCapped = true;
-          break outer;
-        }
+        if (SKIP_LAST_DATA_ROW) {
+          if (pendingRowArray !== null) {
+            if (rowsWritten >= MAX_SALES_ROWS) {
+              job.importCapped = true;
+              pendingRowArray = null;
+              pendingRowNumber = null;
+              break outer;
+            }
+            await flushPendingDirectRow();
+          }
+          if (rowsWritten >= MAX_SALES_ROWS) {
+            job.importCapped = true;
+            pendingRowArray = null;
+            pendingRowNumber = null;
+            break outer;
+          }
+          pendingRowArray = rowArray;
+          pendingRowNumber = rowNumber;
+        } else {
+          if (rowsWritten >= MAX_SALES_ROWS) {
+            job.importCapped = true;
+            break outer;
+          }
 
-        validateRowInto(rowArray, columnPlanStruct, rowDataOut);
+          validateRowInto(rowArray, columnPlanStruct, rowDataOut);
 
-        try {
-          enrichImportFactRow(rowDataOut, masters);
-          const writeResult = writer.appendRow(rowDataOut);
-          if (!writeResult.written) {
+          try {
+            enrichImportFactRow(rowDataOut, masters);
+            const writeResult = writer.appendRow(rowDataOut);
+            if (!writeResult.written) {
+              job.failedRows += 1;
+              errorBuffer.push({
+                rowNumber,
+                rowData: slimRowForErrorLog(rowDataOut),
+                errorMessage: writeResult.skipMessage || 'Row skipped for COPY',
+              });
+            } else {
+              rowsWritten += 1;
+              job.checkpointRow = rowNumber;
+              if (writeResult.flushPromise) await writeResult.flushPromise;
+            }
+          } catch (e) {
             job.failedRows += 1;
             errorBuffer.push({
               rowNumber,
               rowData: slimRowForErrorLog(rowDataOut),
-              errorMessage: writeResult.skipMessage || 'Row skipped for COPY',
+              errorMessage: e?.message || String(e),
             });
-          } else {
-            rowsWritten += 1;
-            job.checkpointRow = rowNumber;
-            if (writeResult.flushPromise) await writeResult.flushPromise;
           }
-        } catch (e) {
-          job.failedRows += 1;
-          errorBuffer.push({
-            rowNumber,
-            rowData: slimRowForErrorLog(rowDataOut),
-            errorMessage: e?.message || String(e),
-          });
-        }
 
-        if (errorBuffer.length >= ERROR_BATCH_SIZE) {
-          const toInsert = errorBuffer.splice(0, errorBuffer.length);
-          await saveErrorRows(job.jobId, toInsert);
-        }
+          if (errorBuffer.length >= ERROR_BATCH_SIZE) {
+            const toInsert = errorBuffer.splice(0, errorBuffer.length);
+            await saveErrorRows(job.jobId, toInsert);
+          }
 
-        if (rowsSincePersist >= JOB_UPDATE_EVERY_N_ROWS) {
-          rowsSincePersist = 0;
-          job.processedRows = importProcessedBaseline + rowsWritten;
-          const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 1);
-          job.throughputRps = Number((job.processedRows / elapsedSec).toFixed(2));
-          await updateJobInDb(job.jobId, job);
+          if (rowsSincePersist >= JOB_UPDATE_EVERY_N_ROWS) {
+            rowsSincePersist = 0;
+            job.processedRows = importProcessedBaseline + rowsWritten;
+            const elapsedSec = Math.max((Date.now() - startedAtMs) / 1000, 1);
+            job.throughputRps = Number((job.processedRows / elapsedSec).toFixed(2));
+            await updateJobInDb(job.jobId, job);
+          }
         }
       }
     }
+
+    pendingRowArray = null;
+    pendingRowNumber = null;
   });
 
   job.processedRows = importProcessedBaseline + rowsWritten;
@@ -897,7 +1136,7 @@ async function runQueuedImportJob(job) {
     const checkpointStart = Number(job.checkpointRow || 0);
 
     const masters = await loadImportMastersSnapshot();
-    const importResult = await importExcelDirectToSalesData({
+    const importResult = await importExcelForQueuedJob({
       job,
       filePath,
       checkpointStart,

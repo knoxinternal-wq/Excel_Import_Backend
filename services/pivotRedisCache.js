@@ -9,6 +9,12 @@ const TTL_SEC = Math.min(
   Math.max(300, Number(process.env.PIVOT_REDIS_TTL_SEC) || 420),
 );
 
+/** Pivot filter DISTINCT lists — longer TTL (Excel-like repeat opens). */
+const FILTER_VALUES_TTL_SEC = Math.min(
+  3600,
+  Math.max(120, Number(process.env.PIVOT_FILTER_REDIS_TTL_SEC) || 900),
+);
+
 let client = null;
 let connecting = null;
 
@@ -61,4 +67,26 @@ export async function pivotRedisSet(cacheKey, payload) {
   }
 }
 
-export { TTL_SEC as PIVOT_REDIS_TTL_SEC };
+export async function pivotFilterValuesRedisGet(redisKey) {
+  try {
+    const c = await getClient();
+    if (!c) return null;
+    const raw = await c.get(`pivot:fv:v1:${redisKey}`);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export async function pivotFilterValuesRedisSet(redisKey, payload) {
+  try {
+    const c = await getClient();
+    if (!c) return;
+    await c.set(`pivot:fv:v1:${redisKey}`, JSON.stringify(payload), { EX: FILTER_VALUES_TTL_SEC });
+  } catch {
+    /* ignore */
+  }
+}
+
+export { TTL_SEC as PIVOT_REDIS_TTL_SEC, FILTER_VALUES_TTL_SEC as PIVOT_FILTER_REDIS_TTL_SEC };

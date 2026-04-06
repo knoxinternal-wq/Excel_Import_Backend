@@ -5,7 +5,7 @@
 import 'dotenv/config';
 import pg from 'pg';
 import pgConnString from 'pg-connection-string';
-import { assertDatabaseUrl, buildPoolConfigFromUrl } from '../config/database.js';
+import { assertDatabaseUrl, buildPoolConfigFromUrl, getSupabaseHttpUrl } from '../config/database.js';
 
 function maskUrl(url) {
   return String(url).replace(/:([^@/]+)@/, ':****@');
@@ -35,11 +35,8 @@ async function main() {
   const okApp = await tryPool('App config (your DATABASE_URL)', url);
 
   const parsed = pgConnString.parse(url);
-  const supabaseHost = String(process.env.SUPABASE_URL || '')
-    .replace(/^https?:\/\//i, '')
-    .split('/')[0]
-    .split('.')[0];
-  const ref = supabaseHost || null;
+  const httpUrl = getSupabaseHttpUrl();
+  const ref = httpUrl.match(/^https:\/\/([^.]+)\.supabase\.co\/?$/i)?.[1] || null;
   if (parsed.password != null && ref) {
     const directUrl = `postgresql://postgres:${encodeURIComponent(parsed.password)}@db.${ref}.supabase.co:5432/${parsed.database || 'postgres'}`;
     console.log('\nAlso trying direct Postgres (port 5432, user postgres)…');

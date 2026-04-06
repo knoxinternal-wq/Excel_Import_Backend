@@ -2,7 +2,7 @@ import { getPgPool } from '../config/database.js';
 
 export async function listDistinctFyMonthRows() {
   const pool = getPgPool();
-  if (!pool) throw new Error('DATABASE_URL is not configured');
+  if (!pool) return [];
   const { rows } = await pool.query(
     `SELECT DISTINCT fy, month
      FROM sales_data
