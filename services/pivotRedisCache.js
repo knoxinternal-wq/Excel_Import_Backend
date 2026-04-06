@@ -5,14 +5,14 @@
 import { createClient } from 'redis';
 
 const TTL_SEC = Math.min(
-  7200,
-  Math.max(300, Number(process.env.PIVOT_REDIS_TTL_SEC) || 3600),
+  600,
+  Math.max(300, Number(process.env.PIVOT_REDIS_TTL_SEC) || 420),
 );
 
 /** Pivot filter DISTINCT lists — longer TTL (Excel-like repeat opens). */
 const FILTER_VALUES_TTL_SEC = Math.min(
-  7200,
-  Math.max(120, Number(process.env.PIVOT_FILTER_REDIS_TTL_SEC) || 3600),
+  3600,
+  Math.max(120, Number(process.env.PIVOT_FILTER_REDIS_TTL_SEC) || 900),
 );
 
 let client = null;

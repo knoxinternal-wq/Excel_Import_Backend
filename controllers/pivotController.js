@@ -13,7 +13,7 @@ import { isPivotSqlStatementTimeoutError } from '../services/pivotSql.js';
 const MAX_PIVOT_BODY_LIMIT = 100_000;
 
 const PIVOT_SQL_TIMEOUT_MESSAGE =
-  'Pivot SQL exceeded the configured time limit. Add filters, use fewer row/column fields, or raise PIVOT_PG_STATEMENT_TIMEOUT_MS on the server.';
+  'Pivot SQL timed out on the database server. Add filters or use fewer row/column fields.';
 
 function sendPivotSqlErrorResponse(res, err) {
   if (isPivotSqlStatementTimeoutError(err)) {

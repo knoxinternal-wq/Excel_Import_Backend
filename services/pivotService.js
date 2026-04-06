@@ -6,7 +6,6 @@ import { getAgentNameMasterMap } from './masterLoaders.js';
 import {
   isPivotSqlAggregationEligible,
   isPivotSqlDrilldownEligible,
-  getConfiguredPivotMaxGroupDimensions,
   getPivotSqlPool,
   queryDistinctPivotFilterValues,
   queryPivotGroupBy,
@@ -52,11 +51,10 @@ function isGrandTotalRow(row) {
   return branch === 'total' || branch === 'grand total' || branch.includes('grand total') || branch.includes('grandtotal');
 }
 
-/** In-process pivot payload cache; default 1 hour (analytics workloads repeat heavily). */
-const PIVOT_RESULT_CACHE_TTL_MS = Number(process.env.PIVOT_MEMORY_CACHE_TTL_MS) || 60 * 60 * 1000;
+/** In-process pivot payload cache; default 180s (large tables + repeat layouts). */
+const PIVOT_RESULT_CACHE_TTL_MS = Number(process.env.PIVOT_MEMORY_CACHE_TTL_MS) || 180_000;
 const PIVOT_RESULT_CACHE_MAX = 40;
 const pivotResultCache = new Map();
-const ALLOW_STREAM_FALLBACK = String(process.env.PIVOT_ALLOW_STREAM_FALLBACK || '0').trim() === '1';
 
 function pivotResultCacheKey(normalized) {
   return JSON.stringify({
@@ -964,11 +962,6 @@ export async function runPivot(config = {}) {
   if (!normalized.values.length) {
     throw new Error('Add at least one field to Rows, Columns, or Values.');
   }
-  const dimsCount = (normalized.rows?.length || 0) + (normalized.columns?.length || 0);
-  const maxDims = getConfiguredPivotMaxGroupDimensions();
-  if (dimsCount > maxDims) {
-    throw new Error(`Too many pivot dimensions (${dimsCount}). Maximum supported is ${maxDims}.`);
-  }
   const pCacheKey = pivotResultCacheKey(normalized);
 
   if (isPivotRedisConfigured()) {
@@ -990,11 +983,6 @@ export async function runPivot(config = {}) {
   const metricKeys = values.map((v) => `${v.agg}:${v.field}`);
 
   const usePostgresPivot = isPivotSqlAggregationEligible(normalized, memFilters);
-  if (!usePostgresPivot && getPivotSqlPool() && !ALLOW_STREAM_FALLBACK) {
-    throw new Error(
-      'This pivot config is not supported by the pre-aggregated engine. Use up to 5 dimensions and measures count/sum(net_amount|sl_qty), or set PIVOT_ALLOW_STREAM_FALLBACK=1.',
-    );
-  }
   const result = usePostgresPivot
     ? await runPivotWithPostgres(normalized, sqlFilters, values, metricKeys)
     : await runPivotWithStream(normalized, sqlFilters, memFilters, values, metricKeys);
