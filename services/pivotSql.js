@@ -448,6 +448,14 @@ function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd') {
 
     // Primary keys may be UUID or bigint — never compare via ::numeric or uuid casts of "0".
     if (f.field === 'id') {
+      if (op === 'is_blank') {
+        appendWhere(parts, params, `(TRIM(COALESCE(${col}::text, '')) = '')`);
+        continue;
+      }
+      if (op === 'is_not_blank') {
+        appendWhere(parts, params, `(TRIM(COALESCE(${col}::text, '')) <> '')`);
+        continue;
+      }
       if (op === 'in') {
         const vals = Array.isArray(f.values) ? f.values : [];
         const cleaned = vals.map((v) => String(v ?? '').trim()).filter(Boolean);
@@ -458,7 +466,10 @@ function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd') {
       }
       if (op === 'eq') {
         const v = String(f.value ?? '').trim();
-        if (v === '') continue;
+        if (v === '') {
+          appendWhere(parts, params, `(TRIM(COALESCE(${col}::text, '')) = '')`);
+          continue;
+        }
         const ph = next(v);
         appendWhere(parts, params, `(TRIM(COALESCE(${col}::text, '')) = TRIM(${ph}::text))`);
         continue;
@@ -469,6 +480,33 @@ function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd') {
         const ph = next(`%${inner}%`);
         appendWhere(parts, params, `(LOWER(${col}::text) ILIKE ${ph} ESCAPE '\\')`);
         continue;
+      }
+      continue;
+    }
+
+    if (op === 'is_blank') {
+      if (NUMERIC_FIELDS.has(f.field)) {
+        appendWhere(parts, params, `(${col} IS NULL OR BTRIM(${col}::text) = '')`);
+      } else if (DATE_FIELDS.has(f.field)) {
+        appendWhere(parts, params, `(${col} IS NULL)`);
+      } else if (PARTY_EQ_FIELDS.has(f.field)) {
+        const partyExpr = partyFilterExpr(tableAlias, f.field);
+        appendWhere(parts, params, `(${partyExpr} IS NULL OR BTRIM(${partyExpr}::text) = '')`);
+      } else {
+        appendWhere(parts, params, `(${col} IS NULL OR BTRIM(${col}::text) = '')`);
+      }
+      continue;
+    }
+    if (op === 'is_not_blank') {
+      if (NUMERIC_FIELDS.has(f.field)) {
+        appendWhere(parts, params, `(${col} IS NOT NULL AND BTRIM(${col}::text) <> '')`);
+      } else if (DATE_FIELDS.has(f.field)) {
+        appendWhere(parts, params, `(${col} IS NOT NULL)`);
+      } else if (PARTY_EQ_FIELDS.has(f.field)) {
+        const partyExpr = partyFilterExpr(tableAlias, f.field);
+        appendWhere(parts, params, `(${partyExpr} IS NOT NULL AND BTRIM(${partyExpr}::text) <> '')`);
+      } else {
+        appendWhere(parts, params, `(${col} IS NOT NULL AND BTRIM(${col}::text) <> '')`);
       }
       continue;
     }
@@ -521,17 +559,25 @@ function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd') {
     }
 
     if (NUMERIC_FIELDS.has(f.field) && op === 'eq') {
+      const raw = String(f.value ?? '').trim();
+      const numExpr = numericCoerceExpr(tableAlias, f.field);
+      if (raw === '') {
+        appendWhere(parts, params, `(${numExpr} IS NULL)`);
+        continue;
+      }
       const n = parseFactNumeric(f.value, f.field);
       if (n == null) continue;
       const ph = next(n);
-      const numExpr = numericCoerceExpr(tableAlias, f.field);
       appendWhere(parts, params, `(${numExpr} = ${ph})`);
       continue;
     }
 
     if (DATE_FIELDS.has(f.field) && op === 'eq') {
       const v = String(f.value ?? '').trim();
-      if (!v) continue;
+      if (!v) {
+        appendWhere(parts, params, `(${col} IS NULL)`);
+        continue;
+      }
       const ph = next(v);
       appendWhere(parts, params, `(((${col})::date) = (${ph})::date)`);
       continue;
@@ -539,7 +585,15 @@ function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd') {
 
     if (op === 'eq') {
       const v = String(f.value ?? '').trim();
-      if (v === '') continue;
+      if (v === '') {
+        if (PARTY_EQ_FIELDS.has(f.field)) {
+          const partyExpr = partyFilterExpr(tableAlias, f.field);
+          appendWhere(parts, params, `(${partyExpr} IS NULL OR BTRIM(${partyExpr}::text) = '')`);
+        } else {
+          appendWhere(parts, params, `(${col} IS NULL OR BTRIM(${col}::text) = '')`);
+        }
+        continue;
+      }
       const ph = next(v);
       if (PARTY_EQ_FIELDS.has(f.field)) {
         const partyExpr = partyFilterExpr(tableAlias, f.field);

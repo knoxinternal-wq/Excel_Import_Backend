@@ -37,7 +37,7 @@ const NUMERIC_FIELDS = SALES_DATA_NUMERIC_COLUMNS_SET;
 
 const DATE_FIELDS = new Set(['bill_date', 'sale_order_date', 'created_at']);
 
-/** Blank / trim semantics are not replicated in PostgREST filters. */
+/** When no Postgres pool, these stay in-memory; with `DATABASE_URL` they map to SQL + PostgREST. */
 const SQL_DEFER_OPS = new Set(['is_blank', 'is_not_blank']);
 
 /** ilike(any) OR-clause size; larger lists stay in-memory to avoid huge URLs. */
@@ -505,6 +505,7 @@ function pivotPostgresWhereFilters(normalized, sqlFilters) {
 function splitFilters(filters) {
   const sqlFilters = [];
   const memFilters = [];
+  const pool = getPivotSqlPool();
   for (const f of filters || []) {
     if (!f || !f.field || !SALES_FIELDS.includes(f.field)) continue;
     if (f.field === 'id') {
@@ -515,11 +516,13 @@ function splitFilters(filters) {
     }
     const op = String(f.operator || 'eq').toLowerCase();
     if (SQL_DEFER_OPS.has(op)) {
-      memFilters.push(f);
+      if (pool) sqlFilters.push(f);
+      else memFilters.push(f);
       continue;
     }
     if (op === 'eq' && normText(f.value) === '' && !NUMERIC_FIELDS.has(f.field) && !DATE_FIELDS.has(f.field)) {
-      memFilters.push(f);
+      if (pool) sqlFilters.push(f);
+      else memFilters.push(f);
       continue;
     }
     if (op === 'in') {
@@ -551,6 +554,28 @@ function applyOneSqlFilter(query, f) {
   let q = query;
   const field = f.field;
   const op = String(f.operator || 'eq').toLowerCase();
+
+  if (op === 'is_blank') {
+    if (NUMERIC_FIELDS.has(field)) {
+      return q.or(`${field}.is.null,${field}.eq.`);
+    }
+    if (DATE_FIELDS.has(field)) {
+      return q.is(field, null);
+    }
+    return q.or(`${field}.is.null,${field}.eq.`);
+  }
+  if (op === 'is_not_blank') {
+    if (field === 'id') {
+      return q.not('id', 'is', null).neq('id', '');
+    }
+    if (NUMERIC_FIELDS.has(field)) {
+      return q.not(field, 'is', null).neq(field, '');
+    }
+    if (DATE_FIELDS.has(field)) {
+      return q.not(field, 'is', null);
+    }
+    return q.not(field, 'is', null).neq(field, '');
+  }
 
   if (op === 'in') {
     const vals = Array.isArray(f.values) ? f.values : [];
@@ -586,6 +611,10 @@ function applyOneSqlFilter(query, f) {
   }
 
   if (NUMERIC_FIELDS.has(field) && op === 'eq') {
+    const raw = String(f.value ?? '').trim();
+    if (raw === '') {
+      return q.or(`${field}.is.null,${field}.eq.`);
+    }
     const n = parseFactNumeric(f.value, field);
     if (n == null) return q;
     return q.eq(field, n);
@@ -593,13 +622,15 @@ function applyOneSqlFilter(query, f) {
 
   if (DATE_FIELDS.has(field) && op === 'eq') {
     const v = String(f.value ?? '').trim();
-    if (!v) return q;
+    if (!v) return q.is(field, null);
     return q.eq(field, v);
   }
 
   if (op === 'eq') {
     const v = normText(f.value);
-    if (v === '') return q;
+    if (v === '') {
+      return q.or(`${field}.is.null,${field}.eq.`);
+    }
     return q.ilike(field, escapeIlikePattern(v));
   }
 
