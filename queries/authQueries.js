@@ -1,5 +1,6 @@
 import { supabase } from '../models/supabase.js';
 import { getPgPool } from '../config/database.js';
+import { logError } from '../utils/logger.js';
 
 const DEFAULT_USERS = [
   {
@@ -60,16 +61,24 @@ async function fetchUserFromPg(normalized) {
   const pool = getPgPool();
   if (!pool) return null;
 
-  // Uses direct Postgres lookup for speed. If RLS blocks (role mismatch), result will be null and
-  // we fall back to Supabase REST.
-  const { rows } = await pool.query(
-    `SELECT id, email, password, full_name, is_active
-     FROM app_users
-     WHERE email = $1 AND is_active = true
-     LIMIT 1`,
-    [normalized],
-  );
-  return rows?.[0] ?? null;
+  try {
+    // Uses direct Postgres lookup for speed. On timeout / pool exhaustion / network issues, fall
+    // back to Supabase REST + hardcoded users instead of failing login with HTTP 500.
+    const { rows } = await pool.query(
+      `SELECT id, email, password, full_name, is_active
+       FROM app_users
+       WHERE email = $1 AND is_active = true
+       LIMIT 1`,
+      [normalized],
+    );
+    return rows?.[0] ?? null;
+  } catch (e) {
+    logError('auth', 'fetchUserFromPg failed; falling back to REST', {
+      message: e?.message,
+      code: e?.code,
+    });
+    return null;
+  }
 }
 
 export async function findUserByEmail(email) {
@@ -87,8 +96,8 @@ export async function findUserByEmail(email) {
   }
 
   const p = (async () => {
-    // Seed can run once; do it in parallel with the lookup.
-    await Promise.all([seedDefaultUsersIfPossible()]);
+    // Do not block login on seed (PostgREST can be slow); first request still has hardcoded fallback.
+    void seedDefaultUsersIfPossible();
 
     // Fast path: direct Postgres.
     const pgUser = await fetchUserFromPg(normalized);
