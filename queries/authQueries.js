@@ -20,11 +20,22 @@ const DEFAULT_USERS = [
 let seedAttempted = false;
 
 const USER_CACHE_TTL_MS = Number(process.env.AUTH_USER_CACHE_TTL_MS) || 10 * 60 * 1000;
+const AUTH_LOOKUP_TIMEOUT_MS = Number(process.env.AUTH_LOOKUP_TIMEOUT_MS) || 5_000;
 const userCache = new Map(); // normalizedEmail -> { ts, user }
 const userInflight = new Map(); // normalizedEmail -> Promise<user|null>
 
 function normalizeEmail(email) {
   return String(email || '').trim().toLowerCase();
+}
+
+function withTimeout(promise, timeoutMs) {
+  const ms = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.floor(timeoutMs) : 5_000;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      setTimeout(() => resolve(null), ms);
+    }),
+  ]);
 }
 
 async function seedDefaultUsersIfPossible() {
@@ -99,12 +110,14 @@ export async function findUserByEmail(email) {
     // Do not block login on seed (PostgREST can be slow); first request still has hardcoded fallback.
     void seedDefaultUsersIfPossible();
 
-    // Fast path: direct Postgres.
-    const pgUser = await fetchUserFromPg(normalized);
+    // Query Postgres + Supabase concurrently. This avoids additive waits when one backend is slow.
+    const pgPromise = withTimeout(fetchUserFromPg(normalized), AUTH_LOOKUP_TIMEOUT_MS);
+    const sbPromise = withTimeout(fetchUserFromSupabase(normalized), AUTH_LOOKUP_TIMEOUT_MS);
+
+    const pgUser = await pgPromise;
     if (pgUser) return pgUser;
 
-    // Compatibility path: Supabase REST.
-    const sbUser = await fetchUserFromSupabase(normalized);
+    const sbUser = await sbPromise;
     if (sbUser) return sbUser;
 
     // Final fallback: hardcoded dev users (works even if app_users table/policies aren't ready).
