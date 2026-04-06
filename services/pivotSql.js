@@ -79,17 +79,18 @@ function getPivotAggregationTimeoutMs() {
 }
 
 /**
- * DISTINCT filter lists + drilldown SQL — separate budget so dropdowns still work when the cube is capped at 5s.
+ * DISTINCT filter lists + drilldown SQL — separate from pivot aggregation timeout.
+ * Default 3 min so large `sales_data` scans finish; client axios should stay ≥ this (see frontend timing.js).
  * Override with `PIVOT_FILTER_SQL_TIMEOUT_MS` (ms); `0` = off.
  */
 function getPivotSupportingSqlTimeoutMs() {
   const raw = process.env.PIVOT_FILTER_SQL_TIMEOUT_MS;
   if (raw !== undefined && raw !== '') {
     const n = Number(raw);
-    if (!Number.isFinite(n) || n < 0) return 90_000;
+    if (!Number.isFinite(n) || n < 0) return 180_000;
     return Math.floor(n);
   }
-  return 90_000;
+  return 180_000;
 }
 
 function resolveStatementTimeoutMs(options = {}) {
