@@ -46,24 +46,36 @@ const FILTER_VALUES_CACHE_MAX = Number(process.env.PIVOT_FILTER_VALUES_CACHE_MAX
 const filterValuesCache = new Map();
 
 /**
- * Per-statement timeout for pivot **aggregation** (GROUP BY / MV paths). Default 5s.
- * Set `PIVOT_PG_STATEMENT_TIMEOUT_MS` (ms) to override; use `0` to disable.
- * If unset, `PIVOT_SLA_MS` is used when you want SLA without renaming the PG var.
+ * Per-statement timeout for pivot **aggregation** (GROUP BY / MV paths).
+ * - Local default: 5s (fail fast while developing).
+ * - Production default (`NODE_ENV=production` and unset): 3 minutes — large fact tables need more time on Render etc.
+ * - Override: `PIVOT_PG_STATEMENT_TIMEOUT_MS` (ms) or `PIVOT_SLA_MS`; `0` = disable (not recommended on shared DBs).
  */
+function isProductionLikeHost() {
+  if (String(process.env.NODE_ENV || '').toLowerCase() === 'production') return true;
+  // Render.com sets RENDER=true; pivot needs more than 5s on large tables if PIVOT_PG_STATEMENT_TIMEOUT_MS is unset.
+  if (String(process.env.RENDER || '').toLowerCase() === 'true') return true;
+  return false;
+}
+
+function defaultPivotAggregationTimeoutMs() {
+  return isProductionLikeHost() ? 180_000 : 5000;
+}
+
 function getPivotAggregationTimeoutMs() {
   const raw = process.env.PIVOT_PG_STATEMENT_TIMEOUT_MS;
   if (raw !== undefined && raw !== '') {
     const n = Number(raw);
-    if (!Number.isFinite(n) || n < 0) return 5000;
+    if (!Number.isFinite(n) || n < 0) return defaultPivotAggregationTimeoutMs();
     return Math.floor(n);
   }
   const sla = process.env.PIVOT_SLA_MS;
   if (sla !== undefined && sla !== '') {
     const n = Number(sla);
-    if (!Number.isFinite(n) || n < 0) return 5000;
+    if (!Number.isFinite(n) || n < 0) return defaultPivotAggregationTimeoutMs();
     return Math.floor(n);
   }
-  return 5000;
+  return defaultPivotAggregationTimeoutMs();
 }
 
 /**
