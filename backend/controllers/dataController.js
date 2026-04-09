@@ -233,18 +233,14 @@ function isUnfilteredSalesWhere(whereSql) {
   return String(whereSql || '').trim() === 'TRUE';
 }
 
-/** ~instant row estimate from planner stats (no full COUNT). Good when WHERE is TRUE. */
+/** ~instant row estimate from pg_class.reltuples (no full COUNT). Good when WHERE is TRUE. */
 async function getApproximateSalesRowCount(pool) {
   try {
     const { rows } = await pool.query(`
-      SELECT GREATEST(
-        COALESCE(NULLIF(s.n_live_tup, 0), 0),
-        COALESCE(NULLIF(FLOOR(c.reltuples)::bigint, 0), 0)
-      )::bigint AS n
+      SELECT reltuples::bigint AS n
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
-      LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid AND s.schemaname = n.nspname
-      WHERE n.nspname = 'public' AND c.relname = 'sales_data' AND c.relkind = 'r'
+      WHERE n.nspname = 'public' AND c.relname = 'sales_data'
       LIMIT 1
     `);
     const n = Number(rows[0]?.n);
@@ -314,6 +310,9 @@ export async function getData(req, res) {
     const cursorRaw = req.query.cursorId;
     const cursorId =
       cursorRaw != null && String(cursorRaw).trim() !== '' ? String(cursorRaw).trim() : null;
+    const afterIdRaw = req.query.afterId;
+    const afterId =
+      afterIdRaw != null && String(afterIdRaw).trim() !== '' ? String(afterIdRaw).trim() : null;
     const sortBy = req.query.sortBy || 'id';
     const sortOrder = req.query.sortOrder === 'asc';
     const useKeysetPaging = String(req.query.paging || '').toLowerCase() === 'keyset';
@@ -400,11 +399,12 @@ export async function getData(req, res) {
       sortBy: orderColumn,
       sortOrder: sortOrder ? 'asc' : 'desc',
       cursorId: cursorId || 0,
+      afterId: afterId || '',
       paging: useKeysetPaging ? 'keyset' : 'offset',
     });
     const cacheItem = dataPageCache.get(buildDataCacheKey(page));
     if (cacheItem && (Date.now() - cacheItem.ts) < DATA_PAGE_CACHE_TTL_MS) {
-      res.set('Cache-Control', 'private, max-age=0, must-revalidate');
+      res.set('Cache-Control', 'private,no-store');
       res.set('X-Data-Cache', 'HIT');
       return res.json(cacheItem.payload);
     }
@@ -434,7 +434,11 @@ export async function getData(req, res) {
         const fetchRowsPg = async (pageNum) => {
           const params = [...filterParams];
           let sql;
-          if (useKeysetPaging && orderColumn === 'id' && cursorId != null) {
+          if (afterId && orderColumn === 'id') {
+            params.push(afterId);
+            sql = `SELECT ${dataCols} FROM sales_data WHERE ${whereSql} AND (sales_data.id > $${params.length}) ORDER BY sales_data.id ASC NULLS LAST LIMIT $${params.length + 1}`;
+            params.push(limit);
+          } else if (useKeysetPaging && orderColumn === 'id' && cursorId != null) {
             const op = sortOrder ? '>' : '<';
             params.push(cursorId);
             sql = `SELECT ${dataCols} FROM sales_data WHERE ${whereSql} AND (${orderColQ} ${op} $${params.length}) ORDER BY ${orderColQ} ${orderDir} NULLS LAST LIMIT $${params.length + 1}`;
@@ -451,7 +455,8 @@ export async function getData(req, res) {
         let totalPg = null;
         let rowsPg = [];
         let countEstimated = false;
-        const parallelCountAndRowsPg = includeTotal && page === 1 && !useKeysetPaging;
+        const parallelCountAndRowsPg =
+          includeTotal && page === 1 && !useKeysetPaging && !afterId;
 
         if (parallelCountAndRowsPg) {
           if (useApproxCount) {
@@ -522,6 +527,7 @@ export async function getData(req, res) {
             total: resolvedTotalPg,
             totalPages: resolvedTotalPagesPg,
             nextCursor: rowsPg && rowsPg.length ? rowsPg[rowsPg.length - 1]?.id ?? null : null,
+            lastId: rowsPg && rowsPg.length ? rowsPg[rowsPg.length - 1]?.id ?? null : null,
             ...(countEstimated ? { countEstimated: true } : {}),
           },
         };
@@ -530,7 +536,7 @@ export async function getData(req, res) {
           const k = dataPageCache.keys().next().value;
           dataPageCache.delete(k);
         }
-        res.set('Cache-Control', 'private, max-age=0, must-revalidate');
+        res.set('Cache-Control', 'private,no-store');
         res.set('X-Data-Cache', 'MISS');
         res.set('X-Data-Source', 'postgres');
         return res.json(payloadPg);
@@ -571,14 +577,18 @@ export async function getData(req, res) {
         }
         query = query.or(orParts.join(','));
       }
-      query = query.order(orderColumn, { ascending: sortOrder });
-      if (useKeysetPaging && orderColumn === 'id' && cursorId != null) {
-        query = sortOrder ? query.gt('id', cursorId) : query.lt('id', cursorId);
-        query = query.limit(limit);
+      if (afterId && orderColumn === 'id') {
+        query = query.order('id', { ascending: true }).gt('id', afterId).limit(limit);
       } else {
-        const from = (pageNum - 1) * limit;
-        const to = from + limit - 1;
-        query = query.range(from, to);
+        query = query.order(orderColumn, { ascending: sortOrder });
+        if (useKeysetPaging && orderColumn === 'id' && cursorId != null) {
+          query = sortOrder ? query.gt('id', cursorId) : query.lt('id', cursorId);
+          query = query.limit(limit);
+        } else {
+          const from = (pageNum - 1) * limit;
+          const to = from + limit - 1;
+          query = query.range(from, to);
+        }
       }
       return query;
     };
@@ -586,7 +596,8 @@ export async function getData(req, res) {
     let total = null;
     let rows = [];
     /** First Data tab load: COUNT was fully sequential before row query — huge delay on Lakh-scale tables. */
-    const parallelCountAndRows = includeTotal && page === 1 && !useKeysetPaging;
+    const parallelCountAndRows =
+      includeTotal && page === 1 && !useKeysetPaging && !afterId;
 
     if (parallelCountAndRows) {
       const [totalResult, rowResult] = await Promise.all([runCount(), fetchRowsForPage(1)]);
@@ -642,6 +653,7 @@ export async function getData(req, res) {
         total: resolvedTotal,
         totalPages: resolvedTotalPages,
         nextCursor: rows && rows.length ? rows[rows.length - 1]?.id ?? null : null,
+        lastId: rows && rows.length ? rows[rows.length - 1]?.id ?? null : null,
       },
     };
     dataPageCache.set(buildDataCacheKey(page), { ts: Date.now(), payload });
@@ -649,7 +661,7 @@ export async function getData(req, res) {
       const k = dataPageCache.keys().next().value;
       dataPageCache.delete(k);
     }
-    res.set('Cache-Control', 'private, max-age=0, must-revalidate');
+    res.set('Cache-Control', 'private,no-store');
     res.set('X-Data-Cache', 'MISS');
     res.set('X-Data-Source', 'supabase');
     res.json(payload);

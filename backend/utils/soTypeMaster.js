@@ -66,23 +66,40 @@ export function buildSoTypeMasterMap(rows) {
   return map;
 }
 
-export async function loadSoTypeMasterMap(supabase) {
+export async function loadSoTypeMasterMap(supabase, pool = null) {
   const map = new Map();
+  const ingest = (rows) => {
+    for (const row of rows || []) {
+      addSoTypeKey(map, extractPartyName(row), extractTypeOfOrder(row), parseOrderDateMs(row));
+    }
+  };
   const pageSize = 1000;
   for (const tableName of SO_TYPE_MASTER_TABLES) {
     let from = 0;
+    let supabaseFailed = false;
     for (;;) {
       const to = from + pageSize - 1;
       const { data, error } = await supabase.from(tableName).select('*').range(from, to);
       if (error) {
         logWarn('soTypeMaster', 'table load skipped', { tableName, error: error.message });
+        supabaseFailed = true;
         break;
       }
-      for (const row of data || []) {
-        addSoTypeKey(map, extractPartyName(row), extractTypeOfOrder(row), parseOrderDateMs(row));
-      }
+      ingest(data);
       if (!data || data.length < pageSize) break;
       from += pageSize;
+    }
+    if (supabaseFailed && pool) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const { rows } = await pool.query(`SELECT * FROM ${tableName}`);
+        ingest(rows);
+      } catch (e) {
+        logWarn('soTypeMaster', 'postgres fallback table load failed', {
+          tableName,
+          error: e?.message || String(e),
+        });
+      }
     }
   }
   return map;

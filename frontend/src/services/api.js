@@ -11,6 +11,31 @@ const API_BASE = (() => {
   return `${backendUrl.replace(/\/+$/, '')}/api`;
 })();
 
+axios.interceptors.request.use((config) => {
+  try {
+    const raw = sessionStorage.getItem('auth_session');
+    if (raw) {
+      const s = JSON.parse(raw);
+      if (s?.token) {
+        const headers = config.headers || {};
+        headers.Authorization = `Bearer ${s.token}`;
+        config.headers = headers;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return config;
+});
+
+const inflight = new Map();
+async function dedup(key, fn) {
+  if (inflight.has(key)) return inflight.get(key);
+  const p = fn().finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+
 const FILTER_VALUES_TTL_MS = 30 * 60 * 1000;
 const filterValuesCache = new Map();
 const filterValuesInflight = new Map();
@@ -179,11 +204,15 @@ export const pivotApi = {
     filterValuesInflight.set(cacheKey, req);
     return req;
   },
-  run: (config, requestConfig) =>
-    axios.post(`${API_BASE}/data/report/pivot`, config, {
-      ...longOpts(),
-      ...(requestConfig || {}),
-    }),
+  run: (config, requestConfig) => {
+    const key = `pivot:${JSON.stringify(config)}`;
+    return dedup(key, () =>
+      axios.post(`${API_BASE}/data/report/pivot`, config, {
+        ...longOpts(),
+        ...(requestConfig || {}),
+      }),
+    );
+  },
   drilldown: (payload, requestConfig) =>
     axios.post(`${API_BASE}/data/report/drilldown`, payload, {
       ...longOpts(),

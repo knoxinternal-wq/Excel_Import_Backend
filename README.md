@@ -16,12 +16,13 @@ The application is designed so heavy work happens on the backend, while the fron
 
 ## Tech Stack
 
-- Frontend: React
-- Backend: Node.js + Express
-- Database: PostgreSQL
-- Data access: Supabase client + direct PostgreSQL pool
-- Import processing: ExcelJS, fast-csv, PostgreSQL `COPY`
-- Pivot rendering: backend aggregation + `react-window` virtualization
+- Frontend: React 19 + Vite 7, Tailwind CSS, axios
+- Data tab: `@tanstack/react-virtual` for row virtualization; pivot grid: `react-window`
+- Backend: Node.js (ESM) + Express
+- Database: PostgreSQL (partitioned `sales_data`, staging table, materialized views for pivot fast paths)
+- Data access: Supabase JS client + direct `pg` pool (`DATABASE_URL`)
+- Import processing: ExcelJS, `@fast-csv/parse`, PostgreSQL `COPY` (with optional Supabase REST batch path and bounded concurrency)
+- Pivot: SQL-first `GROUP BY` in `pivotSql.js`, optional Redis (`redis` package)
 
 ## Table of contents
 
@@ -91,10 +92,15 @@ For a full walkthrough of the current data flow and recent behavior, see **[Repo
 ### 5. Admin Tab
 
 - UI component: `frontend/src/components/AdminSOUpload.jsx`
+- Backend: `backend/controllers/adminController.js`, routes under `/api/admin`
 - Purpose:
-  - upload SO master files
-  - preview/edit master tables
-  - view row edit history
+  - upload SO master spreadsheets **per sales channel** into four independent Postgres tables (no unified `so_master`):
+    - `dnj_so_master` (DON AND JULIO)
+    - `ic_so_master` (ITALIAN CHANNEL)
+    - `rf_so_master` (RISHAB FABRICS)
+    - `vercelli_so_master` (VERCELLI)
+  - preview/edit rows and view per-table edit history (`admin_*_so_master_edit_history`) and upload history (`admin_so_master_upload_history`)
+  - manage other editable masters (e.g. `region_master`, `party_master_app`) via generic master-table APIs
 
 ## Project structure and file inventory
 
@@ -102,7 +108,7 @@ For a full walkthrough of the current data flow and recent behavior, see **[Repo
 
 | Path | Role |
 |------|------|
-| `package.json` | React/Vite app scripts (`dev`, `build`); dependencies (`react`, `react-window`, `lucide-react`, `axios`, `xlsx`, `tailwind`). |
+| `package.json` | React/Vite app scripts (`dev`, `build`, `lint`); deps include `react`, `@tanstack/react-virtual`, `react-window`, `lucide-react`, `axios`, `xlsx`, `react-dropzone`, `@supabase/supabase-js`, `html-to-image`. |
 | `vite.config.js` | Dev server **port 3000**; proxies `/api` → `http://localhost:5002` (adjust if your backend `PORT` differs). Long timeouts for large uploads. |
 | `tailwind.config.js` | Tailwind CSS configuration. |
 | `src/main.jsx` | React root mount. |
@@ -122,7 +128,7 @@ For a full walkthrough of the current data flow and recent behavior, see **[Repo
 | `src/components/ImportProgress.jsx` | Polls `GET /api/import/status/:jobId`. |
 | `src/components/ImportHistory.jsx` | Lists jobs via history API. |
 | `src/components/ImportToast.jsx` | Toast notifications. |
-| `src/components/VirtualizedTable.jsx` | **Data tab**: virtualized rows, `dataApi.fetch`. |
+| `src/components/VirtualizedTable.jsx` | **Data tab**: `@tanstack/react-virtual`, keyset pagination from page 2+, `dataApi.fetch`. |
 | `src/components/VirtualizedTableRow.jsx` | Row renderer. |
 | `src/components/DeleteByDate.jsx` | Bulk delete by date range UI. |
 | `src/components/Sidebar.jsx` | Navigation. |
@@ -145,7 +151,7 @@ For a full walkthrough of the current data flow and recent behavior, see **[Repo
 | `repositories/` | e.g. `reportRepository.js` — DB access helpers. |
 | `queries/` | e.g. `authQueries.js`. |
 | `config/` | `database.js` (pg pool), `constants.js` (**required Excel headers**, aliases, import rules). |
-| `models/` | `schema.sql`, `supabase.js` (server Supabase client). |
+| `models/` | `schema.sql` (single DDL source: partitions, staging, MVs, RLS), `supabase.js` (server Supabase client). |
 | `utils/` | `logger`, `salesFacts`, `normalizeHeader`, `customerTypeMaster`, etc. |
 | `uploads/` | Staged uploads and temp CSV shards during import. |
 
@@ -153,7 +159,7 @@ For a full walkthrough of the current data flow and recent behavior, see **[Repo
 
 | File | Role |
 |------|------|
-| `package.json` | **`concurrently`**: runs backend + frontend (`npm run dev`). Also `build`, `start`, `db:migrate`. |
+| `package.json` | **`concurrently`**: `npm run dev` (backend + frontend). Also `build`, `start`, `db:migrate` (runs backend migrate only). |
 
 ## Excel headers → database columns (import mapping)
 
@@ -206,23 +212,27 @@ Summary (Excel → `sales_data`):
 
 ## Reference tables, masters, and enrichment
 
-- **`sales_data`** stores **denormalized text** facts (fast `COPY`). It does **not** use foreign keys to `ref_*` tables in the main design.
-- **`ref_*` tables** (`ref_regions`, `ref_states`, `ref_branches`, `ref_districts`, `ref_cities`, `ref_business_types`, `ref_brands`, `ref_agents`, `ref_parties`, `ref_items`, `ref_item_categories`) hold **master lists** and hierarchies for dropdowns and optional validation. The view **`region_master`** is defined in `schema.sql` as `ref_states` ⨝ `ref_regions` for **state → region**.
-- **Import enrichment** (`enrichImportFactRow`, `importEnrichFactRow.js`, masters snapshot): joins in memory / lookups from **`agent_name_master`**, **`party_grouping_master`**, **`customer_type_master`**, **`so_master`**, **`region_master`** / ref tables, etc., to fill derived fields (e.g. agent display names, party grouping, business type, SO type, region from state).
-- **Pivot** may re-read masters for display (`masterLoaders.js`, agent name enrichment on streamed pages).
+- **`sales_data`** stores **denormalized** facts (fast `COPY`). In `schema.sql` it is **partitioned by `bill_date`** (FY partitions plus `sales_data_default`); an **unlogged `sales_data_staging`** table supports the import pipeline. There are **no FKs** from `sales_data` to `ref_*` in the main design.
+- **`ref_*` tables** (`ref_regions`, `ref_states`, `ref_branches`, `ref_districts`, `ref_cities`, `ref_business_types`, `ref_brands`, `ref_agents`, `ref_parties`, `ref_items`, `ref_item_categories`) hold **reference lists** and hierarchies for dropdowns and validation.
+- **`region_master`** is a **real table** (state → region), seeded from `ref_states` / `ref_regions` in `schema.sql` and **editable in Admin** alongside imports that need a stable state→region map.
+- **SO type / SO master lookups** use **four legacy tables** (loaded in the import snapshot and resolved by brand in `soTypeMaster.js` / `soMasterLoader.js`):
+  - `dnj_so_master`, `ic_so_master`, `rf_so_master`, `vercelli_so_master`
+- **`party_master_app`** — application party master with RLS; used where the app needs account/location-style party attributes.
+- **Import enrichment** (`enrichImportFactRow` in `importEnrichFactRow.js`, `loadImportMastersSnapshot`): in-memory lookups from **`agent_name_master`**, **`party_grouping_master`**, **`customer_type_master`**, the four SO master tables, **`region_master`**, and related refs to fill derived fields (agent names, party grouping, business type, SO type, region, FY/month from bill date, etc.).
+- **Pivot** may re-read masters for display (`masterLoaders.js`, e.g. agent labels on streamed pages).
 
 ## SQL files in this repository
 
-There is **1** SQL file tracked under `backend/`:
+There is **one** SQL DDL file under `backend/`:
 
 | # | File | Purpose |
 |---|------|---------|
-| 1 | `backend/models/schema.sql` | **Source of truth**: `sales_data`, `ref_*`, masters, `import_jobs`, RLS policies, views (`region_master`, `v_distinct_states`), indexes. Applied by `npm run db:migrate` (`scripts/migrate.js`). |
+| 1 | `backend/models/schema.sql` | **Source of truth**: extensions (`pgcrypto`, `pg_trgm`), `ref_*`, masters (`party_master_app`, `region_master`, agent/party/customer masters), **partitioned** `sales_data`, `sales_data_staging`, import tables (`import_jobs`, `import_errors`), admin history tables, **materialized views** (`mv_sales_state_month`, `mv_sales_branch_brand`, `mv_sales_agent_party_month`, `sales_mv`), four `*_so_master` tables + indexes + RLS, expression indexes for pivot DISTINCT paths, etc. |
 
-**How they are applied**
+**How it is applied**
 
-- **`schema.sql`**: `cd backend && npm run db:migrate` (requires `DATABASE_URL`).
-- All indexes, constraints, MVs, and maintenance-ready DDL are centralized in this file.
+- From repo root: `npm run db:migrate`, or `cd backend && npm run db:migrate` (runs `scripts/migrate.js`; requires `DATABASE_URL`).
+- After schema changes that add or redefine MVs, refresh them on the target DB: `cd backend && npm run db:refresh-pivot-mv`.
 
 ## Backend HTTP routes (mount points)
 
@@ -234,7 +244,7 @@ There is **1** SQL file tracked under `backend/`:
 | `/api/auth` | `routes/auth.js` | `POST /login` |
 | `/api/admin` | `routes/admin.js` | SO master + master-table CRUD/history |
 
-Default **backend** port is **`process.env.PORT || 5001`** in `server.js`. **Vite** defaults to proxying `/api` to port **5002** in `frontend/vite.config.js` — align ports or change the proxy to match your backend.
+Default **backend** port is **`process.env.PORT || 5001`** in `server.js`. **`frontend/vite.config.js`** proxies `/api` to **`http://localhost:5002`**. Either set **`PORT=5002`** for the backend in dev or change the Vite proxy target to **`5001`** so the SPA and API stay on the same port pair.
 
 ## End-to-End Data Flow
 
@@ -313,7 +323,7 @@ Behavior:
 
 Important rendering method:
 
-- `VirtualizedTable.jsx` uses row virtualization so only visible rows are mounted in the DOM
+- `VirtualizedTable.jsx` uses **`@tanstack/react-virtual`** so only visible rows are mounted; from **page 2+** it prefers **keyset** (`afterId`) paging to avoid deep `OFFSET` on large tables.
 
 ### Backend data-tab flow
 
@@ -459,7 +469,13 @@ flowchart LR
   - **Supporting queries** (DISTINCT filter lists, drilldown SQL): uses **`PIVOT_FILTER_SQL_TIMEOUT_MS`** (default **180000 ms**) unless overridden.
 - Optional per-transaction tuning: **`PIVOT_PG_WORK_MEM`**, **`PIVOT_PG_PARALLEL_WORKERS`** (`SET LOCAL`).
 - **`queryPivotGroupBy`** — Builds `SELECT … FROM sales_data sd … WHERE … GROUP BY` with `BTRIM`-aligned dimensions and measure expressions aligned with import numeric parsing.
-- **Fast paths** — When the layout matches configured materialized views, the query may use a pre-aggregated path first and fall back to live `sales_data` on error. Examples: **`sales_pivot_mv`** (`PIVOT_SOURCE_RELATION`), **`mv_sales_brand_state_month`** (brand × state × month sum net), **`sales_mv`** (state × branch × brand × calendar month — see `matchSalesMvStateBranchBrandMonth` in `pivotSql.js`; disable with **`PIVOT_MV_SALES=0`**).
+- **Fast paths** — When the layout matches a registered MV, the query uses it first and **falls back** to live `sales_data` on error. Objects from `schema.sql` (names overridable via env — see `pivotSql.js`):
+  - **`mv_sales_state_month`** — env `PIVOT_MV_STATE_MONTH` (default `mv_sales_state_month`)
+  - **`mv_sales_branch_brand`** — `PIVOT_MV_BRANCH_BRAND` (default `mv_sales_branch_brand`)
+  - **`mv_sales_agent_party_month`** — `PIVOT_MV_AGENT_PARTY_MONTH` (default `mv_sales_agent_party_month`)
+  - **`sales_mv`** — state × branch × brand × calendar month (`matchSalesMvStateBranchBrandMonth`); disable with **`PIVOT_MV_SALES=0`** or rename via **`PIVOT_MV_SALES`**
+  - **Optional** — **`PIVOT_SOURCE_RELATION`**: name of a custom materialized view for the **`sales_pivot_mv`-style** path
+  - **Optional** — **`PIVOT_MV_BRAND_STATE_MONTH`**: enables a brand × state × month MV path if you create that MV in the database
 - **`queryDistinctPivotFilterValues`** — `SELECT DISTINCT BTRIM(col::text) … ORDER BY 1 LIMIT n` (friendly to expression indexes defined in `backend/models/schema.sql`); in-memory + optional Redis caching.
 
 Response **`meta`** includes **`engine`** (`postgres` | `stream`), **`executionMs`**, **`memFiltersCount`**, optional **`warnings`** (e.g. high-cardinality dimensions), and when **`PIVOT_DEBUG_ENGINE=1`** the server logs filter split and eligibility checks. **`PIVOT_LOG_SQL`** / **`PIVOT_EXPLAIN_SQL`** (see `backend/.env.example`) aid plan analysis.
@@ -487,10 +503,14 @@ These are the main areas that evolved in the Report tab stack (backend + fronten
 | `REDIS_URL` / `REDISCLOUD_URL` | Optional Redis for pivot + filter caches. |
 | `PIVOT_DEBUG_ENGINE` | `1` = console logs for filter split + engine eligibility + stream fallback. |
 | `PIVOT_LOG_SQL` / `PIVOT_EXPLAIN_SQL` | Log SQL and optional `EXPLAIN ANALYZE` (debug; `EXPLAIN` runs an extra query). |
-| `PIVOT_MV_SALES` | `0` disables `sales_mv` fast path; default relation name `sales_mv`. |
+| `PIVOT_MV_SALES` | `0` disables `sales_mv` fast path; optional rename via same variable. |
+| `PIVOT_MV_STATE_MONTH` / `PIVOT_MV_BRANCH_BRAND` / `PIVOT_MV_AGENT_PARTY_MONTH` | Override default MV relation names for the three smaller MVs. |
+| `PIVOT_SOURCE_RELATION` | Optional custom MV name for the `sales_pivot_mv` code path. |
+| `PIVOT_MV_BRAND_STATE_MONTH` | Optional: set to your MV name to enable brand × state × month fast path. |
+| `PIVOT_PG_SKIP_FACT_ROW_COUNT` | Default `1` skips an expensive fact-table count in some MV paths; set `0` for exact totals. |
 | `PIVOT_FILTER_BATCH_CONCURRENCY` | Max parallel DISTINCT queries in batch filter API (default 5). |
 
-See `backend/.env.example` for comments and defaults.
+See `backend/.env.example` for comments and defaults (if present locally; it may be gitignored in your clone).
 
 ### Operational notes
 
@@ -623,8 +643,10 @@ Primary fact table:
 
 Performance-related improvements:
 
+- **range partitions** on `sales_data` by `bill_date` (add new FY partitions as needed)
 - normalized searchable columns such as `norm_party`, `norm_brand`, `norm_agent`, `norm_state`
-- indexes on normalized fields and date/FY groupers (see `schema.sql` and optional migrations in [SQL files](#sql-files-in-this-repository))
+- indexes on normalized fields, dates, and pivot DISTINCT expressions (see `schema.sql`)
+- **materialized views** for common pivot slices; refresh after large loads (`npm run db:refresh-pivot-mv` in `backend`)
 - SQL-first pivot aggregation
 - paginated data fetching instead of full-table loading
 - cached pivot/filter/data requests
@@ -698,16 +720,13 @@ Copy from `frontend/.env.example`. Important:
 
 ### Common tuning variables (backend)
 
-- `IMPORT_SUPABASE_BATCH_SIZE`
-- `IMPORT_JOB_UPDATE_EVERY_ROWS`
-- `IMPORT_CANCEL_CHECK_EVERY_ROWS`
-- `IMPORT_COPY_PARALLEL`
-- `IMPORT_COPY_ROW_BATCH`
-- `IMPORT_COPY_BUFFER_BYTES`
-- `IMPORT_WORKER_CONCURRENCY`
+- `IMPORT_SUPABASE_BATCH_SIZE` — rows per Supabase REST batch insert (capped in code)
+- `IMPORT_SUPABASE_BATCH_CONCURRENCY` — max concurrent batch flushes (capped in code)
+- `IMPORT_SUPABASE_TIMEOUT_MIN_BATCH` / `IMPORT_SUPABASE_RETRY_MAX` — batch path timeouts/retries
+- `IMPORT_JOB_UPDATE_EVERY_ROWS`, `IMPORT_CANCEL_CHECK_EVERY_ROWS`
+- `IMPORT_COPY_PARALLEL`, `IMPORT_COPY_ROW_BATCH`, `IMPORT_COPY_BUFFER_BYTES`, `IMPORT_WORKER_CONCURRENCY`
 - `PIVOT_MEMORY_CACHE_TTL_MS`
-- `API_RATE_WINDOW_MS`
-- `API_RATE_MAX`
+- `API_RATE_WINDOW_MS`, `API_RATE_MAX` — in-memory rate limit middleware
 
 ## Scripts
 
@@ -732,25 +751,22 @@ Common backend commands:
 cd backend
 npm run dev
 npm run start
-npm run db:migrate
+npm run db:migrate      # apply schema.sql
 npm run db:verify
+npm run db:diagnose-party-master
 npm run db:seed
 npm run db:import-party-grouping
 npm run db:backfill-so-type
-npm run db:pivot-enterprise
-npm run db:refresh-pivot-mv
+npm run db:refresh-pivot-mv   # REFRESH MATERIALIZED VIEW for all pivot MVs in script
 ```
 
 Useful Node scripts in `backend/scripts`:
 
-- `migrate.js`
-- `verify-db.js`
-- `seed-party-grouping.js`
-- `import-party-grouping.js`
-- `check-party-mapping.js`
-- `check-district.js`
-- `backfill-so-type.js`
-- `backfill-district.js`
+- `migrate.js`, `verify-db.js`, `refresh-pivot-mvs.js`
+- `seed-party-grouping.js`, `import-party-grouping.js`
+- `check-party-mapping.js`, `check-district.js`, `check-db-connection.js`
+- `backfill-so-type.js`, `backfill-district.js`
+- `diagnose-party-master-app.mjs`
 
 All SQL DDL and performance objects now live in:
 
@@ -761,12 +777,14 @@ All SQL DDL and performance objects now live in:
 - Import jobs are asynchronous; upload returns `jobId` before full import completes.
 - Data tab always loads a page, not the full dataset.
 - Pivot tab aggregates on the backend, not in the browser; the pivot **body** can be loaded in pages (`bodyOffset` / `bodyLimit`) while totals reflect the full result (see [Report tab section](#report-tab-pivot-architecture-and-data-flow)).
-- Admin tab is used for SO master upload and editable master-table management.
+- Admin tab uploads SO masters into **four channel tables** (`dnj_so_master`, `ic_so_master`, `rf_so_master`, `vercelli_so_master`) and supports other editable masters (`region_master`, `party_master_app`, etc.).
 - Session is cleared automatically after 15 minutes of inactivity.
 
 ## Further documentation
 
-- **`docs/pivot-table-readme.md`** — Extended pivot behavior, API payloads, and operational notes (companion to the [Report tab](#report-tab-pivot-architecture-and-data-flow) section above).
+- **`docs/data-import-process.md`** — Import pipeline and operational notes.
+- **`docs/data-tab-readme.md`** — Data tab behavior and API usage.
+- **`docs/pivot-table-readme.md`** — Extended pivot behavior, payloads, and tuning (companion to the [Report tab](#report-tab-pivot-architecture-and-data-flow) section).
 
 ## Cleanup Notes
 

@@ -2,7 +2,7 @@ import {
   useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState,
   memo,
 } from 'react';
-import { List, useDynamicRowHeight } from 'react-window';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   Loader2,
   Rows3,
@@ -16,7 +16,6 @@ import {
   PanelRightOpen,
   GripVertical,
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { pivotApi, peekPivotFilterValuesCache } from '../../services/api';
 import { MAX_SALES_ROWS } from '../../constants/limits';
 import {
@@ -263,7 +262,7 @@ function buildColumnHeaderRows(columnHeaders = []) {
 /** Rows per API page; grand totals always come from full aggregation. Next pages reuse server pivot cache. */
 const PIVOT_BODY_PAGE_SIZE = 100;
 /** Default / minimum row height before dynamic measure (wrapped text grows rows). */
-const PIVOT_BODY_ROW_HEIGHT = 40;
+const PIVOT_BODY_ROW_HEIGHT = 36;
 const FILTER_RUN_DEBOUNCE_MS = 1100;
 /** Longer TTL repeats same layout/filter faster without hitting the API. */
 const PIVOT_CLIENT_CACHE_TTL_MS = 120_000;
@@ -365,7 +364,7 @@ function useDebouncedValue(value, delayMs) {
 const PivotVirtualRow = memo(function PivotVirtualRow({
   index,
   style,
-  ariaAttributes,
+  ariaAttributes = {},
   orderedBodyRows,
   rowHeaderFields,
   descriptors,
@@ -569,7 +568,7 @@ export default function PivotReport() {
   const [exportingPivot, setExportingPivot] = useState(false);
   const tableWrapRef = useRef(null);
   const pivotGridRef = useRef(null);
-  /** Fills space between pivot header and grand-total row; height drives react-window List. */
+  /** Fills space between pivot header and grand-total row; height drives virtualized body. */
   const pivotListWrapRef = useRef(null);
   /** Single horizontal scroll for header + virtualized body + footer (avoids stacked scrollbars). */
   const pivotHScrollRef = useRef(null);
@@ -934,22 +933,6 @@ export default function PivotReport() {
     debouncedFiltersPayload,
     subtotalFields,
   ]);
-
-  const onPivotBodyRowsRendered = useCallback(
-    (_visible, all) => {
-      if (pivotLoadAll) return;
-      if (!result?.meta?.bodyPaging?.truncatedAfter) return;
-      const n = orderedBodyRows.length;
-      if (n === 0) return;
-      if (all.stopIndex >= n - 8) void loadMorePivotBody();
-    },
-    [
-      pivotLoadAll,
-      result?.meta?.bodyPaging?.truncatedAfter,
-      orderedBodyRows.length,
-      loadMorePivotBody,
-    ],
-  );
 
   useEffect(() => () => {
     if (pivotRequestAbortRef.current) pivotRequestAbortRef.current.abort();
@@ -1533,21 +1516,35 @@ export default function PivotReport() {
     [layoutColumnWidths],
   );
 
-  const pivotDynamicRowKey = useMemo(() => {
-    if (!orderedBodyRows.length) return 'empty';
-    const tail = orderedBodyRows[orderedBodyRows.length - 1];
-    return `${orderedBodyRows.length}|${orderedBodyRows[0]?.key ?? ''}|${tail?.key ?? ''}|w${pivotOuterWidth}|sb${toolsCollapsed ? 1 : 0}`;
-  }, [orderedBodyRows, pivotOuterWidth, toolsCollapsed]);
+  const pivotScrollRef = useRef(null);
 
-  const pivotDynamicRowHeight = useDynamicRowHeight({
-    defaultRowHeight: PIVOT_BODY_ROW_HEIGHT,
-    key: pivotDynamicRowKey,
+  const rowVirtualizer = useVirtualizer({
+    count: orderedBodyRows.length,
+    getScrollElement: () => pivotScrollRef.current,
+    estimateSize: () => PIVOT_BODY_ROW_HEIGHT,
+    overscan: 10,
   });
 
   const listViewportHeight = useMemo(() => {
     if (orderedBodyRows.length === 0) return 0;
     return Math.max(80, pivotListViewportPx);
   }, [orderedBodyRows.length, pivotListViewportPx]);
+
+  const onPivotVirtualScroll = useCallback(() => {
+    if (pivotLoadAll) return;
+    if (!result?.meta?.bodyPaging?.truncatedAfter) return;
+    const n = orderedBodyRows.length;
+    if (n === 0) return;
+    const vis = rowVirtualizer.getVirtualItems();
+    if (!vis.length) return;
+    if (vis[vis.length - 1].index >= n - 8) void loadMorePivotBody();
+  }, [
+    pivotLoadAll,
+    result?.meta?.bodyPaging?.truncatedAfter,
+    orderedBodyRows.length,
+    rowVirtualizer,
+    loadMorePivotBody,
+  ]);
 
   const buildVisibleGrid = useCallback(() => {
     if (!result) return [];
@@ -1695,14 +1692,22 @@ export default function PivotReport() {
       const grid = selectedGrid;
       if (!grid?.length) return;
       try {
-        const wb = XLSX.utils.book_new();
-        const ws = XLSX.utils.aoa_to_sheet(grid);
-        XLSX.utils.book_append_sheet(wb, ws, 'Pivot');
+        const csv = grid
+          .map((r) =>
+            r.map((c) => `"${String(c ?? '').replace(/"/g, '""')}"`).join(','),
+          )
+          .join('\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
         const stamp = new Date().toISOString().slice(0, 10);
-        XLSX.writeFile(wb, `pivot_report_${stamp}.xlsx`);
-        setCopyStatus('Selected range downloaded as Excel.');
+        a.download = `pivot_report_${stamp}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+        setCopyStatus('Selected range downloaded as CSV.');
       } catch (e) {
-        setError(e?.message || 'Failed to export Excel.');
+        setError(e?.message || 'Failed to export CSV.');
       }
       return;
     }
@@ -2007,23 +2012,44 @@ export default function PivotReport() {
                   className="flex min-h-0 w-full min-w-0 flex-1 flex-col overflow-hidden"
                 >
                   {orderedBodyRows.length > 0 ? (
-                    <List
-                      key={`${pivotLoadAll ? 'all' : 'paged'}-${[...rows].join('\0')}-${[...columns].join('\0')}-${toolsCollapsed ? 'tc' : 'te'}`}
-                      rowComponent={PivotVirtualRow}
-                      rowCount={orderedBodyRows.length}
-                      rowHeight={pivotDynamicRowHeight}
-                      rowProps={pivotListRowProps}
-                      overscanCount={8}
-                      onRowsRendered={onPivotBodyRowsRendered}
+                    <div
+                      ref={pivotScrollRef}
                       className="pivot-body-list min-h-0 w-full scroll-smooth"
                       style={{
                         height: listViewportHeight,
                         width: '100%',
                         minHeight: 0,
                         overflowX: 'hidden',
+                        overflowY: 'auto',
                         scrollBehavior: 'smooth',
                       }}
-                    />
+                      onScroll={onPivotVirtualScroll}
+                    >
+                      <div
+                        style={{
+                          height: rowVirtualizer.getTotalSize(),
+                          width: '100%',
+                          position: 'relative',
+                        }}
+                      >
+                        {rowVirtualizer.getVirtualItems().map((vRow) => (
+                          <PivotVirtualRow
+                            key={vRow.key}
+                            index={vRow.index}
+                            style={{
+                              position: 'absolute',
+                              top: 0,
+                              left: 0,
+                              width: '100%',
+                              height: `${vRow.size}px`,
+                              transform: `translateY(${vRow.start}px)`,
+                              boxSizing: 'border-box',
+                            }}
+                            {...pivotListRowProps}
+                          />
+                        ))}
+                      </div>
+                    </div>
                   ) : null}
                   {bodyLoadingMore && (
                     <div className="flex shrink-0 items-center justify-center gap-2 border-t border-slate-200 bg-slate-50 py-2 text-[11px] text-slate-600" role="status" aria-label="Loading more pivot rows">

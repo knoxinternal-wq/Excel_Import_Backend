@@ -4,7 +4,7 @@
  * Verifies that Excel import data can be written to and read from the database.
  */
 import 'dotenv/config';
-import { supabase } from '../models/supabase.js';
+import { supabase, supabaseAdmin } from '../models/supabase.js';
 
 async function verify() {
   console.log('=== Database Verification ===\n');
@@ -79,7 +79,14 @@ async function verify() {
     goods_type: 'Fresh',
   };
 
-  const { data: inserted, error: insertError } = await supabase
+  const writer = supabaseAdmin;
+  if (!writer) {
+    console.error('   SKIP: set SUPABASE_SERVICE_ROLE_KEY to test INSERT/DELETE (anon has SELECT-only on sales_data).');
+    console.log('\n=== Verification complete (reads only) ===');
+    return;
+  }
+
+  const { data: inserted, error: insertError } = await writer
     .from('sales_data')
     .insert(testRow)
     .select('id, bill_no, bill_date, item_no, net_amount')
@@ -108,7 +115,7 @@ async function verify() {
 
   // 4. Clean up test row
   console.log('\n4. Deleting test row...');
-  const { error: deleteError } = await supabase
+  const { error: deleteError } = await writer
     .from('sales_data')
     .delete()
     .eq('id', inserted.id);

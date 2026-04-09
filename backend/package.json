@@ -13,11 +13,14 @@
     "db:seed": "node scripts/seed-party-grouping.js",
     "db:import-party-grouping": "node scripts/import-party-grouping.js",
     "db:backfill-so-type": "node scripts/backfill-so-type.js",
-    "db:refresh-pivot-mv": "node scripts/refresh-pivot-mvs.js"
+    "db:refresh-pivot-mv": "node scripts/refresh-pivot-mvs.js",
+    "db:seed-users": "node scripts/seed-users.js",
+    "db:cleanup": "node scripts/cleanup-old-jobs.js"
   },
   "dependencies": {
     "@fast-csv/parse": "^5.0.5",
     "@supabase/supabase-js": "^2.99.0",
+    "bcrypt": "^5.1.1",
     "bullmq": "^5.71.1",
     "compression": "^1.8.1",
     "cors": "^2.8.5",

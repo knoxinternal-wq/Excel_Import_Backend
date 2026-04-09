@@ -608,7 +608,6 @@ BEGIN
       ADD CONSTRAINT unique_region_master_state UNIQUE (state);
   END IF;
 END $$;
-CREATE INDEX IF NOT EXISTS idx_region_master_state ON region_master (state);
 CREATE INDEX IF NOT EXISTS idx_region_master_region ON region_master (region);
 
 INSERT INTO region_master (state, region)

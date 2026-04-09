@@ -17,3 +17,16 @@ if (!supabaseUrl) {
 }
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+const serviceKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+
+/** Service role client for INSERT/UPDATE/DELETE (bypasses RLS). Omit key to disable writes via REST. */
+export const supabaseAdmin =
+  serviceKey ? createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } }) : null;
+
+export function getSupabaseAdminOrThrow() {
+  if (!supabaseAdmin) {
+    throw new Error('SUPABASE_SERVICE_ROLE_KEY is required for this operation.');
+  }
+  return supabaseAdmin;
+}

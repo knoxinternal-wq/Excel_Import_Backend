@@ -9,7 +9,7 @@
  * Otherwise: party_grouped = party_name_for_count = to_party_name
  */
 import 'dotenv/config';
-import { supabase } from '../models/supabase.js';
+import { supabase, getSupabaseAdminOrThrow } from '../models/supabase.js';
 
 function derivePartyGrouped(fullName) {
   const s = String(fullName || '').trim();
@@ -70,11 +70,12 @@ async function seed() {
   }
 
   console.log(`3. Inserting ${toInsert.length} new rows...`);
+  const admin = getSupabaseAdminOrThrow();
   const BATCH = 100;
   let inserted = 0;
   for (let i = 0; i < toInsert.length; i += BATCH) {
     const batch = toInsert.slice(i, i + BATCH);
-    const { error: insertError } = await supabase.from('party_grouping_master').insert(batch);
+    const { error: insertError } = await admin.from('party_grouping_master').insert(batch);
     if (insertError) {
       console.error('   FAILED:', insertError.message);
       return;

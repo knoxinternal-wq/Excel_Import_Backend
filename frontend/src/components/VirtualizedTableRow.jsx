@@ -1,8 +1,16 @@
-import { memo } from 'react';
+import React, { memo } from 'react';
 import { getSalesCellDisplayValue, NUMERIC_KEYS } from '../utils/salesTableCellFormat';
 
-function VirtualizedTableRow({ virtualRow, row, columns, totalWidth }) {
+export const VirtualizedTableRow = memo(function VirtualizedTableRow({
+  row,
+  style,
+  virtualRow,
+  columns,
+  totalWidth,
+}) {
   if (!row) return null;
+  const top = style?.top ?? Math.round(virtualRow?.start ?? 0);
+  const rowHeight = style?.height ?? `${virtualRow?.size}px`;
   return (
     <div
       style={{
@@ -11,8 +19,8 @@ function VirtualizedTableRow({ virtualRow, row, columns, totalWidth }) {
         left: 0,
         width: totalWidth,
         boxSizing: 'border-box',
-        height: `${virtualRow.size}px`,
-        transform: `translateY(${Math.round(virtualRow.start)}px)`,
+        height: typeof rowHeight === 'number' ? `${rowHeight}px` : rowHeight,
+        transform: `translateY(${top}px)`,
       }}
       className="flex items-center border-b border-slate-100 hover:bg-slate-50/80"
     >
@@ -33,15 +41,8 @@ function VirtualizedTableRow({ virtualRow, row, columns, totalWidth }) {
       })}
     </div>
   );
-}
+}, (prev, next) =>
+  prev.row?.id === next.row?.id
+  && (prev.style?.top ?? prev.virtualRow?.start) === (next.style?.top ?? next.virtualRow?.start));
 
-function propsEqual(prev, next) {
-  if (prev.virtualRow.index !== next.virtualRow.index) return false;
-  if (prev.virtualRow.start !== next.virtualRow.start) return false;
-  if (prev.virtualRow.size !== next.virtualRow.size) return false;
-  if (prev.row !== next.row) return false;
-  if (prev.totalWidth !== next.totalWidth) return false;
-  return prev.columns === next.columns;
-}
-
-export default memo(VirtualizedTableRow, propsEqual);
+export default VirtualizedTableRow;

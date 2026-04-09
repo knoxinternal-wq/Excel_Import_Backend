@@ -453,6 +453,7 @@ export default function VirtualizedTable({ refreshInterval, refreshTrigger, boot
                   <VirtualizedTableRow
                     key={virtualRow.key}
                     virtualRow={virtualRow}
+                    style={{ top: Math.round(virtualRow.start) }}
                     row={data[virtualRow.index]}
                     columns={displayColumns}
                     totalWidth={tableTotalWidth}
