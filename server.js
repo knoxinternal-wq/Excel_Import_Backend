@@ -16,10 +16,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 5001;
+const PORT = process.env.PORT || 5002;
 
+app.use(compression({ level: 6, threshold: 1024 }));
 app.use(cors());
-app.use(compression({ threshold: 1024 }));
 app.use(express.json({ limit: '2mb' }));
 
 // Lightweight in-memory rate limit for API abuse protection.

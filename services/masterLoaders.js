@@ -48,7 +48,7 @@ export function getCustomerTypeMasterMap() {
 }
 
 export function getSoTypeMasterMap() {
-  return getOrLoadMaster(KEY_SO_TYPE, () => loadSoTypeMasterMap(supabase));
+  return getOrLoadMaster(KEY_SO_TYPE, () => loadSoTypeMasterMap(supabase, getPgPool()));
 }
 
 /** Call after writes to Supabase SO master tables (e.g. dnj_so_master) so legacy resolveSoType sees updates. */
@@ -89,6 +89,17 @@ async function loadAgentNameMapUncached() {
     .select('"Agent Name", "Combined Name"');
   if (error) {
     logWarn('masterLoaders', 'agent_name_master load failed', { error: error.message });
+    const pool = getPgPool();
+    if (pool) {
+      try {
+        const r = await pool.query('SELECT "Agent Name", "Combined Name" FROM agent_name_master');
+        return buildAgentNameMapFromRows(r.rows || []);
+      } catch (e) {
+        logWarn('masterLoaders', 'agent_name_master postgres fallback failed', {
+          error: e?.message || String(e),
+        });
+      }
+    }
     return new Map();
   }
   const map = buildAgentNameMapFromRows(data);
@@ -361,6 +372,19 @@ async function loadPartyGroupingSearchRowsUncached() {
       .range(from, to);
     if (error) {
       logWarn('masterLoaders', 'party_grouping search rows load failed', { error: error.message });
+      const pool = getPgPool();
+      if (pool) {
+        try {
+          const r = await pool.query(
+            'SELECT to_party_name, party_grouped, party_name_for_count FROM party_grouping_master',
+          );
+          return r.rows || [];
+        } catch (e) {
+          logWarn('masterLoaders', 'party_grouping search rows postgres fallback failed', {
+            error: e?.message || String(e),
+          });
+        }
+      }
       return [];
     }
     for (const row of data || []) rows.push(row);

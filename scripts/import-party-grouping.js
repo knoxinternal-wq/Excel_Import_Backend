@@ -6,7 +6,7 @@
  * Table has only 3 columns: TO PARTY NAME, PARTY GROUPED, PARTY NAME FOR COUNT
  */
 import 'dotenv/config';
-import { supabase } from '../models/supabase.js';
+import { getSupabaseAdminOrThrow } from '../models/supabase.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -41,6 +41,7 @@ function parseCSV(content) {
 }
 
 async function main() {
+  const supabase = getSupabaseAdminOrThrow();
   if (!fs.existsSync(csvPath)) {
     console.error('File not found:', csvPath);
     console.log('Usage: node scripts/import-party-grouping.js <path-to-csv>');

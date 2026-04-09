@@ -19,14 +19,21 @@ import {
 
 const router = express.Router();
 
-router.get('/', getData);
-router.get('/states', getStates);
+function cacheControl(v) {
+  return (req, res, next) => {
+    res.set('Cache-Control', v);
+    next();
+  };
+}
+
+router.get('/', cacheControl('private,no-store'), getData);
+router.get('/states', cacheControl('public,max-age=300'), getStates);
 router.get('/filter-options', getFilterOptions);
 router.post('/delete-range/preview', previewDeleteByDateRange);
 router.delete('/delete-range', deleteByDateRange);
 router.get('/report/meta', getReportMeta);
-router.get('/report/fields', getPivotFieldsHandler);
-router.get('/report/filter-values', getPivotFilterValuesHandler);
+router.get('/report/fields', cacheControl('public,max-age=3600'), getPivotFieldsHandler);
+router.get('/report/filter-values', cacheControl('public,max-age=300,stale-while-revalidate=60'), getPivotFilterValuesHandler);
 router.post('/report/filter-values-batch', getPivotFilterValuesBatchHandler);
 router.post('/report/pivot', getPivotDataHandler);
 router.get('/pivot', getPivotQuickHandler);

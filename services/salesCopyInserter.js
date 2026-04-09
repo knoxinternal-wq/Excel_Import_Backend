@@ -287,6 +287,79 @@ export class SalesCopyWriter {
   }
 }
 
+const GIN_INDEXES = [
+  'idx_sales_party_trgm',
+  'idx_sales_agent_trgm',
+  'idx_sales_item_trgm',
+  'idx_sales_bill_no_trgm',
+  'idx_sales_party_grouped_trgm',
+];
+
+const GIN_DEFS = {
+  idx_sales_party_trgm:
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_party_trgm ON sales_data USING gin (to_party_name gin_trgm_ops)',
+  idx_sales_agent_trgm:
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_agent_trgm ON sales_data USING gin (agent_name gin_trgm_ops)',
+  idx_sales_item_trgm:
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_item_trgm ON sales_data USING gin (item_no gin_trgm_ops)',
+  idx_sales_bill_no_trgm:
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_bill_no_trgm ON sales_data USING gin (bill_no gin_trgm_ops)',
+  idx_sales_party_grouped_trgm:
+    'CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_sales_party_grouped_trgm ON sales_data USING gin (party_grouped gin_trgm_ops)',
+};
+
+/**
+ * Indian FY partition name from bill date (Apr–Mar), e.g. 2025-04-02 → sales_data_fy_2025_26.
+ * @param {string} dateStr
+ * @returns {string | null}
+ */
+export function getPartitionName(dateStr) {
+  if (!dateStr) return null;
+  const s = String(dateStr).trim();
+  const ymd = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!ymd) return null;
+  const y = parseInt(ymd[1], 10);
+  const m = parseInt(ymd[2], 10);
+  if (!Number.isFinite(y) || !Number.isFinite(m)) return null;
+  const fyStart = m >= 4 ? y : y - 1;
+  return `sales_data_fy_${fyStart}_${String(fyStart + 1).slice(-2)}`;
+}
+
+export async function truncateSalesDataStaging(pool) {
+  if (!pool) return;
+  try {
+    await pool.query('TRUNCATE TABLE sales_data_staging');
+  } catch (e) {
+    logWarn('import', 'staging truncate failed', { message: e?.message });
+  }
+}
+
+async function rebuildGinIndexesWithPool(pool) {
+  if (!pool) return;
+  for (const [, ddl] of Object.entries(GIN_DEFS)) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await pool.query(ddl);
+    } catch (e) {
+      logWarn('import', 'GIN index rebuild failed', { message: e?.message });
+    }
+  }
+}
+
+/** Drop heavy GIN indexes on sales_data before bulk COPY (caller may rebuild after). */
+export async function dropSalesDataGinIndexes(client) {
+  for (const idx of GIN_INDEXES) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await client.query(`DROP INDEX IF EXISTS ${idx}`);
+    } catch (e) {
+      logWarn('import', `DROP INDEX ${idx} failed`, { message: e?.message });
+    }
+  }
+}
+
+export { rebuildGinIndexesWithPool as rebuildSalesDataGinIndexesPool };
+
 export async function withImportDbClient(fn) {
   const pool = getPgPool();
   if (!pool) {
@@ -327,10 +400,12 @@ export async function withSalesCopyImport(fn, options = {}) {
     throw new Error('Excel import needs DATABASE_URL in backend/.env.');
   }
   const connStr = assertImportDbUrl();
-  const client = await pool.connect();
   const targetTable = options.targetTable || 'sales_data';
+  const skipGinToggle = Boolean(options.skipGinToggle);
+  const client = await pool.connect();
   /** @type {import('stream').Writable | null} */
   let copyStream = null;
+  let copySucceeded = false;
   client.once('error', (err) => {
     logError('import', 'PostgreSQL client error', { message: err?.message, code: err?.code });
     if (copyStream && !copyStream.destroyed && typeof copyStream.destroy === 'function') {
@@ -343,11 +418,22 @@ export async function withSalesCopyImport(fn, options = {}) {
   });
   try {
     await applyImportSessionSettings(client, connStr, { verbose: true });
+    if (!skipGinToggle) {
+      for (const idx of GIN_INDEXES) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await client.query(`DROP INDEX IF EXISTS ${idx}`);
+        } catch (e) {
+          logWarn('import', `DROP INDEX ${idx} failed`, { message: e?.message });
+        }
+      }
+    }
     copyStream = client.query(copyFrom(buildCopySql(targetTable)));
     const writer = new SalesCopyWriter(client, copyStream);
     try {
       await fn(writer);
       await writer.complete();
+      copySucceeded = true;
     } catch (e) {
       try {
         copyStream?.destroy(e instanceof Error ? e : new Error(String(e)));
@@ -358,5 +444,9 @@ export async function withSalesCopyImport(fn, options = {}) {
     }
   } finally {
     client.release();
+    if (copySucceeded && !skipGinToggle) {
+      await rebuildGinIndexesWithPool(pool);
+    }
+    await truncateSalesDataStaging(pool);
   }
 }

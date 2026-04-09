@@ -5,7 +5,7 @@ import path from 'path';
 import { finished } from 'node:stream/promises';
 import { normalizeHeader } from '../utils/normalizeHeader.js';
 import { v4 as uuidv4 } from 'uuid';
-import { supabase } from '../models/supabase.js';
+import { supabase, supabaseAdmin } from '../models/supabase.js';
 import {
   SKIP_COLUMN_A,
   SKIP_LAST_DATA_ROW,
@@ -486,9 +486,10 @@ async function withSupabaseBatchImport(runner) {
     return msg.includes('statement timeout') || msg.includes('canceling statement due to statement timeout');
   };
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const restClient = supabaseAdmin || supabase;
   const insertRowsWithRetry = async (rows, attempt = 0) => {
     if (!rows.length) return;
-    const { error } = await supabase.from('sales_data').insert(rows, { ignoreDuplicates: false });
+    const { error } = await restClient.from('sales_data').insert(rows, { ignoreDuplicates: false });
     if (!error) return;
     const shouldSplit = isStatementTimeoutErr(error) && rows.length > SUPABASE_IMPORT_TIMEOUT_MIN_BATCH;
     const shouldRetry = attempt < SUPABASE_IMPORT_RETRY_MAX;
@@ -1256,6 +1257,22 @@ async function updateJobInDb(jobId, job) {
 
 async function saveErrorRows(jobId, entries) {
   if (entries.length === 0) return;
+  const pool = getPgPool();
+  if (pool) {
+    try {
+      for (const { rowNumber, rowData, errorMessage } of entries) {
+        // eslint-disable-next-line no-await-in-loop
+        await pool.query(
+          `INSERT INTO import_errors (job_id, row_number, row_data, error_message)
+           VALUES ($1, $2, $3::jsonb, $4)`,
+          [jobId, rowNumber, JSON.stringify(rowData ?? {}), errorMessage],
+        );
+      }
+      return;
+    } catch (e) {
+      logError('import', 'save error rows (pg) failed', { error: e?.message });
+    }
+  }
   try {
     const rows = entries.map(({ rowNumber, rowData, errorMessage }) => ({
       job_id: jobId,
@@ -1263,7 +1280,9 @@ async function saveErrorRows(jobId, entries) {
       row_data: rowData,
       error_message: errorMessage,
     }));
-    await supabase.from('import_errors').insert(rows);
+    const client = supabaseAdmin || supabase;
+    const { error } = await client.from('import_errors').insert(rows);
+    if (error) throw new Error(error.message);
   } catch (e) {
     logError('import', 'save error rows failed', { error: e?.message });
   }

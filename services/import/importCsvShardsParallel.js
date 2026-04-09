@@ -3,7 +3,15 @@
  */
 import fs from 'fs';
 import { parse } from '@fast-csv/parse';
-import { withSalesCopyImport, SALES_COPY_COLUMNS } from '../salesCopyInserter.js';
+import { getPgPool } from '../../config/database.js';
+import {
+  withSalesCopyImport,
+  SALES_COPY_COLUMNS,
+  dropSalesDataGinIndexes,
+  rebuildSalesDataGinIndexesPool,
+  truncateSalesDataStaging,
+  getPartitionName,
+} from '../salesCopyInserter.js';
 import { enrichImportFactRow } from './importEnrichFactRow.js';
 
 const RN = '__import_rn';
@@ -17,6 +25,42 @@ function slimRowForErrorLog(data) {
     item_no: data?.item_no ?? null,
     to_party_name: data?.to_party_name ?? null,
   };
+}
+
+function readFirstBillDateFromShardCsv(shardPath) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const stream = fs.createReadStream(shardPath);
+    const parser = parse({ headers: true, ignoreEmpty: true, trim: true });
+    parser.on('data', (row) => {
+      if (done) return;
+      done = true;
+      stream.destroy();
+      const v = row?.bill_date;
+      resolve(v != null && String(v).trim() !== '' ? String(v).trim() : null);
+    });
+    parser.on('end', () => {
+      if (done) return;
+      done = true;
+      resolve(null);
+    });
+    parser.on('error', reject);
+    stream.pipe(parser);
+  });
+}
+
+async function resolveCopyTargetTable(pool, shardPath, multiShard) {
+  if (multiShard) return 'sales_data';
+  const bill = await readFirstBillDateFromShardCsv(shardPath);
+  const part = getPartitionName(bill);
+  if (!part || !pool) return 'sales_data';
+  try {
+    const { rows } = await pool.query('SELECT to_regclass($1)::text AS r', [`public.${part}`]);
+    if (rows[0]?.r) return part;
+  } catch {
+    /* ignore */
+  }
+  return 'sales_data';
 }
 
 /**
@@ -35,6 +79,8 @@ function slimRowForErrorLog(data) {
  * @param {number} opts.startedAtMs
  * @param {number} [opts.processedRowsBaseline]
  * @param {number} [opts.failedRowsBaseline]
+ * @param {string} [opts.targetTable]
+ * @param {boolean} [opts.skipGinToggle]
  */
 async function importOneShard({
   shardPath,
@@ -52,6 +98,8 @@ async function importOneShard({
   startedAtMs,
   processedRowsBaseline = 0,
   failedRowsBaseline = 0,
+  targetTable = 'sales_data',
+  skipGinToggle = false,
 }) {
   let rowsSinceCheck = 0;
   let rowsSincePersist = 0;
@@ -116,7 +164,7 @@ async function importOneShard({
         await saveErrorRows(job.jobId, toInsert);
       }
     }
-  });
+  }, { targetTable, skipGinToggle });
 
   if (errorBuffer.length) {
     await saveErrorRows(job.jobId, errorBuffer);
@@ -150,6 +198,22 @@ export async function importSalesDataFromCsvShards(opts) {
   const N = shardPaths.length;
   const perShardRows = new Array(N).fill(0);
   const perShardFailed = new Array(N).fill(0);
+  const pool = getPgPool();
+  const multiShard = N >= 2;
+
+  if (multiShard && pool) {
+    const c = await pool.connect();
+    try {
+      await dropSalesDataGinIndexes(c);
+    } finally {
+      c.release();
+    }
+  }
+
+  const singleTarget =
+    shardPaths[0] != null
+      ? await resolveCopyTargetTable(pool, shardPaths[0], multiShard)
+      : 'sales_data';
 
   const tasks = shardPaths.map((shardPath, shardIndex) =>
     importOneShard({
@@ -168,10 +232,17 @@ export async function importSalesDataFromCsvShards(opts) {
       startedAtMs,
       processedRowsBaseline,
       failedRowsBaseline,
+      targetTable: multiShard ? 'sales_data' : singleTarget,
+      skipGinToggle: multiShard,
     }),
   );
 
   await Promise.all(tasks);
+
+  if (multiShard && pool) {
+    await rebuildSalesDataGinIndexesPool(pool);
+    await truncateSalesDataStaging(pool);
+  }
 
   const copyFailed = perShardFailed.reduce((a, b) => a + b, 0);
   const copyProcessed = perShardRows.reduce((a, b) => a + b, 0);

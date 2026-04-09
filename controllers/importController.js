@@ -4,7 +4,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import ExcelJS from 'exceljs';
 import { processExcelFile, resumeQueuedImport } from '../services/excelProcessor.js';
-import { supabase } from '../models/supabase.js';
+import { supabase, supabaseAdmin } from '../models/supabase.js';
 import { getPgPool } from '../config/database.js';
 import { REQUIRED_HEADERS } from '../config/constants.js';
 import { logError, logInfo } from '../utils/logger.js';
@@ -145,20 +145,41 @@ export async function getStatus(req, res) {
 export async function cancelImport(req, res) {
   try {
     const { jobId } = req.params;
-    const { data: current, error: readErr } = await supabase
-      .from('import_jobs')
-      .select('id, status')
-      .eq('id', jobId)
-      .single();
-    if (readErr || !current) return res.status(404).json({ error: 'Job not found' });
+    const pool = getPgPool();
+    let current = null;
+    if (pool) {
+      const { rows } = await pool.query(
+        'SELECT id, status FROM import_jobs WHERE id = $1 LIMIT 1',
+        [jobId],
+      );
+      current = rows[0] || null;
+    }
+    if (!current) {
+      const { data, error: readErr } = await supabase
+        .from('import_jobs')
+        .select('id, status')
+        .eq('id', jobId)
+        .single();
+      if (readErr || !data) return res.status(404).json({ error: 'Job not found' });
+      current = data;
+    }
+    if (!current) return res.status(404).json({ error: 'Job not found' });
     if (current.status === 'completed' || current.status === 'failed') {
       return res.status(400).json({ error: `Job already ${current.status}` });
     }
-    const { error } = await supabase
-      .from('import_jobs')
-      .update({ cancelled: true, status: 'cancelled' })
-      .eq('id', jobId);
-    if (error) throw new Error(error.message);
+    if (pool) {
+      await pool.query(
+        `UPDATE import_jobs SET cancelled = true, status = 'cancelled' WHERE id = $1`,
+        [jobId],
+      );
+    } else {
+      const client = supabaseAdmin || supabase;
+      const { error } = await client
+        .from('import_jobs')
+        .update({ cancelled: true, status: 'cancelled' })
+        .eq('id', jobId);
+      if (error) throw new Error(error.message);
+    }
     res.json({ message: 'Cancel requested', jobId });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -168,20 +189,38 @@ export async function cancelImport(req, res) {
 export async function resumeImport(req, res) {
   try {
     const { jobId } = req.params;
-    const { data: row, error } = await supabase
-      .from('import_jobs')
-      .select('*')
-      .eq('id', jobId)
-      .single();
-    if (error || !row) return res.status(404).json({ error: 'Job not found' });
+    const pool = getPgPool();
+    let row = null;
+    if (pool) {
+      const { rows } = await pool.query('SELECT * FROM import_jobs WHERE id = $1 LIMIT 1', [jobId]);
+      row = rows[0] || null;
+    }
+    if (!row) {
+      const { data, error } = await supabase
+        .from('import_jobs')
+        .select('*')
+        .eq('id', jobId)
+        .single();
+      if (error || !data) return res.status(404).json({ error: 'Job not found' });
+      row = data;
+    }
+    if (!row) return res.status(404).json({ error: 'Job not found' });
     if (row.status === 'completed') {
       return res.status(400).json({ error: 'Job already completed' });
     }
-    const { error: updateErr } = await supabase
-      .from('import_jobs')
-      .update({ cancelled: false, status: 'queued', error_message: null })
-      .eq('id', jobId);
-    if (updateErr) throw new Error(updateErr.message);
+    if (pool) {
+      await pool.query(
+        `UPDATE import_jobs SET cancelled = false, status = 'queued', error_message = NULL WHERE id = $1`,
+        [jobId],
+      );
+    } else {
+      const client = supabaseAdmin || supabase;
+      const { error: updateErr } = await client
+        .from('import_jobs')
+        .update({ cancelled: false, status: 'queued', error_message: null })
+        .eq('id', jobId);
+      if (updateErr) throw new Error(updateErr.message);
+    }
     await resumeQueuedImport(jobId);
     res.json({ message: 'Resume requested', jobId });
   } catch (err) {

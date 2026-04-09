@@ -104,12 +104,19 @@ function poolMaxConnections() {
   const raw = String(process.env.PG_POOL_MAX || '').trim();
   const n = raw ? Number(raw) : NaN;
   if (Number.isFinite(n) && n >= 1) return Math.min(50, Math.floor(n));
-  return 15;
+  return 20;
+}
+
+function poolMinConnections() {
+  const raw = String(process.env.PG_POOL_MIN || '').trim();
+  const n = raw ? Number(raw) : NaN;
+  if (Number.isFinite(n) && n >= 0) return Math.min(20, Math.floor(n));
+  return 4;
 }
 
 function poolConnectionTimeoutMs() {
   const n = Number(process.env.PG_CONNECTION_TIMEOUT_MS);
-  return Number.isFinite(n) && n >= 1000 ? Math.floor(n) : 30_000;
+  return Number.isFinite(n) && n >= 1000 ? Math.floor(n) : 5_000;
 }
 
 /**
@@ -121,6 +128,7 @@ export function buildPoolConfigFromUrl(connectionString) {
   return {
     ...base,
     max: poolMaxConnections(),
+    min: poolMinConnections(),
     idleTimeoutMillis: Number(process.env.PG_POOL_IDLE_MS) > 0
       ? Math.floor(Number(process.env.PG_POOL_IDLE_MS))
       : 30_000,

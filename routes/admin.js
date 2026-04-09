@@ -3,6 +3,8 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { requireAuthSession } from '../middleware/authenticateSession.js';
+import { requireAdmin } from '../middleware/requireAdmin.js';
 import {
   importSoMaster,
   previewSoMaster,
@@ -46,6 +48,9 @@ const upload = multer({
 });
 
 const router = express.Router();
+
+router.use(requireAuthSession);
+router.use(requireAdmin);
 
 router.post('/import-so-master', (req, res, next) => {
   upload.single('file')(req, res, (err) => {

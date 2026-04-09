@@ -135,7 +135,7 @@ function buildMasterMap(masterRows) {
   return { soTypeMap, duplicateConflictCount, duplicateConflictExamples };
 }
 
-async function backfillSalesSoType(supabase, soTypeMap) {
+async function backfillSalesSoType(supabase, supabaseWrite, soTypeMap) {
   let totalSalesRowsProcessed = 0;
   let matchedCount = 0;
   let unmatchedCount = 0;
@@ -182,7 +182,7 @@ async function backfillSalesSoType(supabase, soTypeMap) {
 
     for (let i = 0; i < updates.length; i += UPDATE_BATCH_SIZE) {
       const batch = updates.slice(i, i + UPDATE_BATCH_SIZE);
-      const { error: upsertError } = await supabase
+      const { error: upsertError } = await supabaseWrite
         .from('sales_data')
         .upsert(batch, { onConflict: 'id' });
       if (upsertError) throw new Error(`[sales_data upsert] ${upsertError.message}`);
@@ -207,7 +207,8 @@ async function main() {
     path.resolve(process.cwd(), 'backend', '.env'),
   ];
   for (const p of envCandidates) loadEnvFromFile(p);
-  const { supabase } = await import('../models/supabase.js');
+  const { supabase, supabaseAdmin } = await import('../models/supabase.js');
+  const supabaseWrite = supabaseAdmin || supabase;
 
   const { allRows: masterRows, tableStats } = await loadAllMasterRows(supabase);
   const { soTypeMap, duplicateConflictCount, duplicateConflictExamples } = buildMasterMap(masterRows);
@@ -217,7 +218,7 @@ async function main() {
     matchedCount,
     unmatchedCount,
     unmatchedExamples,
-  } = await backfillSalesSoType(supabase, soTypeMap);
+  } = await backfillSalesSoType(supabase, supabaseWrite, soTypeMap);
 
   console.log('\n=== SO TYPE GLOBAL BACKFILL COMPLETE ===');
   console.log('master table row counts:', tableStats);

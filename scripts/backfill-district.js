@@ -59,7 +59,8 @@ function deriveDistrictFromToPartyName(toPartyName, districtMap) {
 
 async function main() {
   loadEnvFromFile(path.resolve(process.cwd(), 'backend', '.env'));
-  const { supabase } = await import('../models/supabase.js');
+  const { supabase, supabaseAdmin } = await import('../models/supabase.js');
+  const writeClient = supabaseAdmin || supabase;
 
   const districtMap = await loadDistrictMasterMap(supabase);
   console.log('district_master_data map size:', districtMap.size);
@@ -100,7 +101,7 @@ async function main() {
     }
 
     if (updates.length > 0) {
-      const u = await supabase.from('sales_data').upsert(updates, { onConflict: 'id' });
+      const u = await writeClient.from('sales_data').upsert(updates, { onConflict: 'id' });
       if (u.error) throw new Error(u.error.message);
       updated += updates.length;
     }
