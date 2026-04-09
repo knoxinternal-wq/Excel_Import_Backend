@@ -1,0 +1,16 @@
+node_modules/
+uploads/
+store/
+import-tmp/
+*.log
+.env
+.env.example
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
