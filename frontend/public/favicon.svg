@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Excel Import System favicon">
+  <defs>
+    <linearGradient id="bg" x1="6" y1="6" x2="58" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4F46E5"/>
+      <stop offset="1" stop-color="#10B981"/>
+    </linearGradient>
+  </defs>
+  <!-- App icon: rounded sheet + pivot-style arrow, inspired by Excel/pivot UI -->
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#bg)"/>
+  <rect x="18" y="14" width="28" height="34" rx="7" fill="rgba(255,255,255,0.10)" stroke="#FFFFFF" stroke-width="2"/>
+  <!-- folded corner -->
+  <path d="M34 14v8h12" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linejoin="round"/>
+
+  <!-- grid -->
+  <path d="M22 24h20" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.95"/>
+  <path d="M22 32h20" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.95"/>
+  <path d="M22 40h20" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.95"/>
+  <path d="M26 20v28" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.9"/>
+  <path d="M34 20v28" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" opacity="0.9"/>
+
+  <!-- pivot arrow -->
+  <path d="M38 22L28 32" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M38 26V22h-4" fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+
