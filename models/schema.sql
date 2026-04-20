@@ -621,3 +621,7 @@ DROP POLICY IF EXISTS "Allow anon full access to region_master" ON region_master
 CREATE POLICY "Allow anon full access to region_master" ON region_master FOR ALL TO anon USING (true) WITH CHECK (true);
 
 ANALYZE sales_data;
+
+ALTER TABLE app_users
+  ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
