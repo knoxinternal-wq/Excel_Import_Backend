@@ -77,8 +77,9 @@ function resolveStatementTimeoutMs(options = {}) {
 /** Larger hash aggregates for million-row GROUP BY (e.g. PIVOT_PG_WORK_MEM=256MB). */
 function pivotSessionWorkMemSql() {
   const raw = String(process.env.PIVOT_PG_WORK_MEM || '').trim();
-  if (!raw) return null;
+  if (!raw) return "SET LOCAL work_mem = '64MB'";
   const compact = raw.replace(/\s+/g, '').toUpperCase();
+  if (compact === '0' || compact === 'OFF' || compact === 'DEFAULT') return null;
   if (!/^\d+(KB|MB|GB|TB)$/.test(compact)) return null;
   const escaped = compact.replace(/'/g, "''");
   return `SET LOCAL work_mem = '${escaped}'`;
@@ -87,7 +88,7 @@ function pivotSessionWorkMemSql() {
 /** Parallel hash aggregate / seq scan (0–8). Empty env = leave server default. */
 function pivotSessionParallelGatherSql() {
   const raw = String(process.env.PIVOT_PG_PARALLEL_WORKERS || '').trim();
-  if (raw === '') return null;
+  if (raw === '') return 'SET LOCAL max_parallel_workers_per_gather = 2';
   const n = Math.floor(Number(raw));
   if (!Number.isFinite(n) || n < 0 || n > 8) return null;
   return `SET LOCAL max_parallel_workers_per_gather = ${n}`;
@@ -453,8 +454,9 @@ export function matchSalesMvStateBranchBrandMonth(normalized, sqlFilters) {
   return true;
 }
 
-function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd') {
-  const parts = [grandTotalBranchExclusionSql(tableAlias)];
+function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd', options = {}) {
+  const excludeGrandTotalBranch = options.excludeGrandTotalBranch !== false;
+  const parts = excludeGrandTotalBranch ? [grandTotalBranchExclusionSql(tableAlias)] : [];
   const params = [];
   let i = 1;
 
@@ -801,7 +803,11 @@ async function queryPivotFromBrandStateMonthMv(sqlFilters) {
   const mvName = String(process.env.PIVOT_MV_BRAND_STATE_MONTH || '').trim();
   if (!mvName) throw new Error('PIVOT_MV_BRAND_STATE_MONTH not configured');
   const mvRel = quoteMvName(mvName);
-  const { whereSql: wMv, params: pMv } = buildWhereFromSqlFilters(sqlFilters, 'mv');
+  const { whereSql: wMv, params: pMv } = buildWhereFromSqlFilters(
+    sqlFilters,
+    'mv',
+    { excludeGrandTotalBranch: false },
+  );
   const { whereSql: wSd, params: pSd } = buildWhereFromSqlFilters(sqlFilters, 'sd');
 
   const groupSql = `
@@ -866,7 +872,11 @@ async function queryPivotFromStateMonthMv(normalized, sqlFilters) {
     if (v.field === 'sl_qty') aggSelects.push(`mv.total_qty AS agg_sum_${vi}`);
     aggSelects.push(`mv.fact_row_count AS agg_rowcnt_${vi}`);
   });
-  const { whereSql, params } = buildWhereFromSqlFilters(sqlFilters, 'mv');
+  const { whereSql, params } = buildWhereFromSqlFilters(
+    sqlFilters,
+    'mv',
+    { excludeGrandTotalBranch: false },
+  );
   const sql = `
     SELECT
       mv.state AS dr_0,
@@ -931,16 +941,22 @@ async function queryPivotFromBranchBrandMv(normalized, sqlFilters) {
 
 function matchAgentPartyMonthMaterializedView(normalized, sqlFilters) {
   const r = normalized.rows || [];
-  if (r.length !== 3 || r[0] !== 'agent_name' || r[1] !== 'to_party_name' || r[2] !== 'month') return false;
+  if (!r.length) return false;
   if ((normalized.columns || []).length !== 0) return false;
+  // mv_sales_agent_party_month only has these dimensions.
+  for (const f of r) {
+    if (!['agent_name', 'to_party_name', 'month'].includes(f)) return false;
+  }
   const v = normalized.values || [];
-  if (!v.length || v.length > 3) return false;
+  if (!v.length || v.length > MAX_VALUE_SPECS) return false;
   for (const spec of v) {
     const agg = String(spec?.agg || '').toLowerCase();
     const field = spec?.field;
-    if (agg !== 'sum') return false;
+    if (!['sum', 'count', 'avg'].includes(agg)) return false;
+    if (agg === 'count') continue; // count(*) from fact_row_count
     if (!['net_amount', 'amount_before_tax', 'sl_qty'].includes(field)) return false;
   }
+  // Keep filters to dimensions physically present on this MV path.
   for (const f of sqlFilters || []) {
     if (!f?.field) continue;
     if (!['agent_name', 'to_party_name'].includes(f.field)) return false;
@@ -950,27 +966,54 @@ function matchAgentPartyMonthMaterializedView(normalized, sqlFilters) {
 
 async function queryPivotFromAgentPartyMonthMv(normalized, sqlFilters) {
   const mvRel = quoteMvName(process.env.PIVOT_MV_AGENT_PARTY_MONTH || 'mv_sales_agent_party_month');
-  const { values } = normalized;
+  const { values, rows: rowFields } = normalized;
+  const selectDims = [];
+  const groupDims = [];
+  rowFields.forEach((f, i) => {
+    const alias = `dr_${i}`;
+    if (f === 'month') {
+      const expr = `TO_CHAR(mv.month::date, 'Mon-YY')`;
+      selectDims.push(`${expr} AS ${alias}`);
+      groupDims.push(expr);
+      return;
+    }
+    const expr = `mv.${quoteIdent(f)}`;
+    selectDims.push(`${expr} AS ${alias}`);
+    groupDims.push(expr);
+  });
   const aggSelects = [];
   values.forEach((v, vi) => {
-    if (v.field === 'net_amount') aggSelects.push(`mv.total_net AS agg_sum_${vi}`);
-    if (v.field === 'amount_before_tax') aggSelects.push(`mv.total_tax AS agg_sum_${vi}`);
-    if (v.field === 'sl_qty') aggSelects.push(`mv.total_qty AS agg_sum_${vi}`);
-    aggSelects.push(`mv.fact_row_count AS agg_rowcnt_${vi}`);
+    const agg = String(v.agg || '').toLowerCase();
+    if (agg === 'count') {
+      aggSelects.push(`SUM(COALESCE(mv.fact_row_count, 1))::bigint AS agg_cnt_${vi}`);
+      return;
+    }
+    let sumExpr = null;
+    if (v.field === 'net_amount') sumExpr = 'mv.total_net';
+    else if (v.field === 'amount_before_tax') sumExpr = 'mv.total_tax';
+    else if (v.field === 'sl_qty') sumExpr = 'mv.total_qty';
+    if (!sumExpr) throw new Error(`Unsupported MV measure: ${v.field}`);
+    if (agg === 'sum') aggSelects.push(`SUM(${sumExpr}) AS agg_sum_${vi}`);
+    if (agg === 'avg') aggSelects.push(`SUM(${sumExpr}) AS agg_avgsum_${vi}`);
+    aggSelects.push(`SUM(COALESCE(mv.fact_row_count, 1))::bigint AS agg_rowcnt_${vi}`);
   });
-  const { whereSql, params } = buildWhereFromSqlFilters(sqlFilters, 'mv');
+  const { whereSql, params } = buildWhereFromSqlFilters(
+    sqlFilters,
+    'mv',
+    { excludeGrandTotalBranch: false },
+  );
+  const groupClause = groupDims.length ? `GROUP BY ${groupDims.map((_, i) => i + 1).join(', ')}` : '';
   const sql = `
     SELECT
-      mv.agent_name AS dr_0,
-      mv.to_party_name AS dr_1,
-      TO_CHAR(mv.month::date, 'Mon-YY') AS dr_2,
+      ${selectDims.join(',\n      ')},
       ${aggSelects.join(',\n      ')}
     FROM ${mvRel} mv
     ${whereSql}
+    ${groupClause}
   `.trim();
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
-    await maybeLogPivotSqlExplain(client, 'mv_agent_party_month', sql, params);
+    await maybeLogPivotSqlExplain(client, 'mv_agent_party_month_rollup', sql, params);
     const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
     return { rows: groupRes.rows, filteredRowCount };
   });

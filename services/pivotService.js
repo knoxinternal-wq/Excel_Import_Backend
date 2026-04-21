@@ -79,6 +79,10 @@ function isGrandTotalRow(row) {
 const PIVOT_RESULT_CACHE_TTL_MS = Number(process.env.PIVOT_MEMORY_CACHE_TTL_MS) || 180_000;
 const PIVOT_RESULT_CACHE_MAX = 40;
 const pivotResultCache = new Map();
+const MAX_PIVOT_VISIBLE_CELLS = Math.max(
+  50_000,
+  Number(process.env.PIVOT_MAX_VISIBLE_CELLS) || 250_000,
+);
 
 function pivotResultCacheKey(normalized) {
   return JSON.stringify({
@@ -88,6 +92,7 @@ function pivotResultCacheKey(normalized) {
     filters: normalized.filters,
     sort: normalized.sort,
     limitRows: normalized.limitRows,
+    subtotalFields: normalized.subtotalFields,
   });
 }
 
@@ -236,6 +241,13 @@ const DEFAULT_PIVOT_VALUES_WHEN_AXES_ONLY = Object.freeze([
   { field: 'id', agg: 'count', label: 'Count of rows' },
 ]);
 
+function normalizeSubtotalFields(rawSubtotalFields, rows) {
+  const allowed = new Set(rows || []);
+  return unique((Array.isArray(rawSubtotalFields) ? rawSubtotalFields : [])
+    .map((f) => String(f || '').trim())
+    .filter((f) => allowed.has(f)));
+}
+
 function normalizeConfig(config = {}) {
   const rows = unique((config.rows || []).filter((f) => SALES_FIELDS.includes(f)));
   const columns = unique((config.columns || []).filter((f) => SALES_FIELDS.includes(f)));
@@ -256,7 +268,8 @@ function normalizeConfig(config = {}) {
   const limitRows = Number.isFinite(rawLimit) && rawLimit > 0
     ? Math.min(MAX_SALES_ROWS, Math.floor(rawLimit))
     : MAX_SALES_ROWS;
-  return { rows, columns, values, filters, sort, limitRows };
+  const subtotalFields = normalizeSubtotalFields(config.subtotalFields, rows);
+  return { rows, columns, values, filters, sort, limitRows, subtotalFields };
 }
 
 function formatAxisValue(v, field) {
@@ -769,7 +782,11 @@ function buildSubtotalDisplayLabels(prefixLabels, depth, rowAxisCols) {
   return labels;
 }
 
-function buildSubtotals(rowHeaders, colHeaders, cellMap, valueKeys, rowFieldCount = 0) {
+function buildSubtotals(rowHeaders, colHeaders, cellMap, valueKeys, rowFieldCount = 0, selectedDepths = null) {
+  const allowedDepths = Array.isArray(selectedDepths)
+    ? new Set(selectedDepths.filter((d) => Number.isInteger(d) && d > 0))
+    : null;
+  if (allowedDepths && allowedDepths.size === 0) return [];
   const byDepth = new Map();
   for (const rowHeader of rowHeaders) {
     const labLen = rowHeader.labels?.length || 0;
@@ -778,6 +795,7 @@ function buildSubtotals(rowHeaders, colHeaders, cellMap, valueKeys, rowFieldCoun
     const maxDepth = labLen ? Math.min(n, labLen) : 0;
     // Include depth === maxDepth when inner row field so "Subtotal" on last field works.
     for (let depth = 1; depth <= maxDepth; depth += 1) {
+      if (allowedDepths && !allowedDepths.has(depth)) continue;
       const prefixLabels = rowHeader.labels.slice(0, depth);
       const subtotalKey = keyFromParts([...prefixLabels, '__subtotal__']);
       if (!byDepth.has(depth)) byDepth.set(depth, new Map());
@@ -884,16 +902,26 @@ function assemblePivotFromCellMap(
     }
   }
 
-  const rowSubtotals = buildSubtotals(
-    rowHeaders,
-    columnHeaders,
-    cellMap,
-    metricKeys,
-    normalized.rows.length,
-  );
+  const subtotalDepths = (normalized.subtotalFields || [])
+    .map((field) => normalized.rows.indexOf(field) + 1)
+    .filter((depth) => depth > 0);
+  const rowSubtotals = subtotalDepths.length > 0
+    ? buildSubtotals(
+      rowHeaders,
+      columnHeaders,
+      cellMap,
+      metricKeys,
+      normalized.rows.length,
+      subtotalDepths,
+    )
+    : [];
 
   const visibleCells = rowHeaders.length * columnHeaders.length * metricKeys.length;
-  if (visibleCells > 250000) throw new Error('Pivot too large. Reduce rows/columns/values or apply filters.');
+  if (visibleCells > MAX_PIVOT_VISIBLE_CELLS) {
+    throw new Error(
+      `Pivot too large (${rowHeaders.length.toLocaleString('en-IN')} rows × ${columnHeaders.length.toLocaleString('en-IN')} columns × ${metricKeys.length.toLocaleString('en-IN')} value(s) = ${visibleCells.toLocaleString('en-IN')} cells; limit ${MAX_PIVOT_VISIBLE_CELLS.toLocaleString('en-IN')}). Reduce row/column fields or apply filters.`,
+    );
+  }
 
   return {
     config: { ...normalized, values },
