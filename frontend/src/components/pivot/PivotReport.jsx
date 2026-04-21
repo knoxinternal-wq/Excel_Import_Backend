@@ -263,7 +263,7 @@ function buildColumnHeaderRows(columnHeaders = []) {
 const PIVOT_BODY_PAGE_SIZE = 100;
 /** Default / minimum row height before dynamic measure (wrapped text grows rows). */
 const PIVOT_BODY_ROW_HEIGHT = 36;
-const FILTER_RUN_DEBOUNCE_MS = 1100;
+const FILTER_RUN_DEBOUNCE_MS = 350;
 /** Longer TTL repeats same layout/filter faster without hitting the API. */
 const PIVOT_CLIENT_CACHE_TTL_MS = 120_000;
 const FILTER_VALUES_LIMIT = 500;
@@ -575,6 +575,8 @@ export default function PivotReport() {
   const pivotSectionRef = useRef(null);
   const runSeqRef = useRef(0);
   const lastRunKeyRef = useRef('');
+  const lastLayoutKeyRef = useRef('');
+  const lastFilterKeyRef = useRef('');
   const pivotRequestAbortRef = useRef(null);
   const loadMoreAbortRef = useRef(null);
   const pivotLoadMoreInflightRef = useRef(false);
@@ -622,7 +624,16 @@ export default function PivotReport() {
   }, [rows, rowSearch]);
   const valueKeys = useMemo(() => (result?.values || []).map((v) => `${v.agg}:${v.field}`), [result]);
   const pivotLayout = useMemo(() => buildPivotLayout(result), [result]);
-  const rowHeaderFields = useMemo(() => (rows.length ? rows : ['(all)']), [rows]);
+  /**
+   * Keep rendered row-header columns aligned with the payload that produced `result`.
+   * If the latest run fails (e.g. pivot too large), `rows` may change while `result` is still previous.
+   * Using result.config.rows avoids stale-result/new-layout mismatch that looks like blank cells.
+   */
+  const rowHeaderFields = useMemo(() => {
+    const fromResult = Array.isArray(result?.config?.rows) ? result.config.rows : [];
+    if (fromResult.length) return fromResult;
+    return rows.length ? rows : ['(all)'];
+  }, [result, rows]);
   const subtotalDepthSet = useMemo(() => {
     const depths = subtotalFields
       .map((f) => rows.indexOf(f) + 1)
@@ -848,6 +859,8 @@ export default function PivotReport() {
     } catch (e) {
       if (e?.code === 'ERR_CANCELED' || e?.name === 'CanceledError') return;
       if (seq !== runSeqRef.current) return;
+      // Avoid showing stale pivot grid from an older layout when the latest run fails.
+      setResult(null);
       setError(parseErr(e, 'Failed to run pivot', LONG_RUNNING_REQUEST_MS));
     } finally {
       if (seq === runSeqRef.current) setRunning(false);
@@ -957,22 +970,60 @@ export default function PivotReport() {
       setResult(null);
       setError(null);
       lastRunKeyRef.current = '';
+      lastLayoutKeyRef.current = '';
+      lastFilterKeyRef.current = '';
       return undefined;
     }
-    const invalidFilterMessage = getInvalidFilterMessage(debouncedFilters);
-    if (invalidFilterMessage) {
+    const layoutKey = JSON.stringify({
+      rows,
+      columns,
+      values: valuesForPivot.map((v) => `${v.agg}:${v.field}`),
+      subtotalFields: [...subtotalFields].sort(),
+    });
+    if (lastLayoutKeyRef.current && lastLayoutKeyRef.current !== layoutKey) {
+      // Layout (rows/columns/values/subtotals) changed: drop old snapshot so UI
+      // cannot show stale structure while the next request is in flight.
       setResult(null);
-      lastRunKeyRef.current = '';
-      setError(invalidFilterMessage);
-      return undefined;
     }
-    runPivot();
+    lastLayoutKeyRef.current = layoutKey;
+    const filterKey = JSON.stringify(debouncedFiltersPayload);
+    if (lastFilterKeyRef.current && lastFilterKeyRef.current !== filterKey) {
+      // Filter checkbox/select changes should refresh the grid from a clean state,
+      // same behavior as row/column layout edits.
+      setResult(null);
+    }
+    lastFilterKeyRef.current = filterKey;
+    // Field-layout changes (rows/columns/values/subtotals/filters) should always fetch
+    // the latest result instead of reusing a stale client cache snapshot.
+    void runPivot(true);
     return undefined;
-  }, [rows, columns, valuesForPivot, debouncedFilters, subtotalFields, loadingFields, runPivot]);
+  }, [
+    rows,
+    columns,
+    valuesForPivot,
+    debouncedFilters,
+    debouncedFiltersPayload,
+    subtotalFields,
+    loadingFields,
+    runPivot,
+  ]);
+
+  // Fail-safe: when fields are selected but result is still empty (e.g. rapid DnD state churn),
+  // force one pivot run so the table always appears.
+  useEffect(() => {
+    if (loadingFields || running || error || result) return undefined;
+    if (!(rows.length > 0 || columns.length > 0 || values.length > 0)) return undefined;
+    const t = setTimeout(() => {
+      void runPivot(true);
+    }, 120);
+    return () => clearTimeout(t);
+  }, [loadingFields, running, error, result, rows, columns, values, runPivot]);
 
   const addFilter = (field) => {
     if (!field) return;
     setFilters((x) => [...x, { field, operator: 'in', values: [], value: '' }]);
+    // Warm this field immediately so the dropdown feels instant when opened.
+    void loadFilterValues(field);
   };
 
   const toggleFilterMultiValue = (filterIndex, optionValue) => {
