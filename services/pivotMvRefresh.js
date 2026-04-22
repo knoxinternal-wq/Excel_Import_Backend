@@ -2,10 +2,13 @@ import { getPgPool } from '../config/database.js';
 import { logInfo, logWarn } from '../utils/logger.js';
 
 export const PIVOT_MVS = Object.freeze([
+  'mv_sales_all_dims',
   'mv_sales_state_month',
   'mv_sales_branch_brand',
   'mv_sales_party_grouped_brand',
   'mv_sales_state_party_grouped_brand',
+  'mv_sales_agent_final_branch',
+  'mv_sales_party_agent_branch',
   'mv_sales_agent_party_month',
   'sales_mv',
 ]);

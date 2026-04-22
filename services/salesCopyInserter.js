@@ -341,6 +341,18 @@ async function rebuildGinIndexesWithPool(pool) {
       // eslint-disable-next-line no-await-in-loop
       await pool.query(ddl);
     } catch (e) {
+      const msg = String(e?.message || '');
+      if (/cannot create index on partitioned table .* concurrently/i.test(msg)) {
+        const nonConcurrentDdl = ddl.replace(/CREATE INDEX CONCURRENTLY/i, 'CREATE INDEX');
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await pool.query(nonConcurrentDdl);
+          continue;
+        } catch (fallbackErr) {
+          logWarn('import', 'GIN index rebuild fallback failed', { message: fallbackErr?.message });
+          continue;
+        }
+      }
       logWarn('import', 'GIN index rebuild failed', { message: e?.message });
     }
   }
@@ -359,6 +371,10 @@ export async function dropSalesDataGinIndexes(client) {
 }
 
 export { rebuildGinIndexesWithPool as rebuildSalesDataGinIndexesPool };
+
+function shouldToggleGinIndexes() {
+  return String(process.env.IMPORT_TOGGLE_GIN_INDEXES || '').trim() === '1';
+}
 
 export async function withImportDbClient(fn) {
   const pool = getPgPool();
@@ -401,7 +417,10 @@ export async function withSalesCopyImport(fn, options = {}) {
   }
   const connStr = assertImportDbUrl();
   const targetTable = options.targetTable || 'sales_data';
-  const skipGinToggle = Boolean(options.skipGinToggle);
+  const skipGinToggle = Boolean(options.skipGinToggle) || !shouldToggleGinIndexes();
+  if (!Boolean(options.skipGinToggle) && skipGinToggle) {
+    logInfo('import', 'GIN toggle disabled for COPY (set IMPORT_TOGGLE_GIN_INDEXES=1 to enable)');
+  }
   const client = await pool.connect();
   /** @type {import('stream').Writable | null} */
   let copyStream = null;

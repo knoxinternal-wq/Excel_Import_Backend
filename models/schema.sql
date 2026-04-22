@@ -494,6 +494,35 @@ GROUP BY 1, 2, 3;
 CREATE INDEX IF NOT EXISTS idx_mv_state_party_grouped_brand
   ON mv_sales_state_party_grouped_brand (state, party_grouped, brand);
 
+DROP MATERIALIZED VIEW IF EXISTS mv_sales_agent_final_branch;
+CREATE MATERIALIZED VIEW mv_sales_agent_final_branch AS
+SELECT
+  agent_name_final,
+  branch,
+  SUM(net_amount) AS total_net,
+  SUM(amount_before_tax) AS total_tax,
+  SUM(sl_qty) AS total_qty,
+  COUNT(*)::bigint AS fact_row_count
+FROM sales_data
+GROUP BY 1, 2;
+CREATE INDEX IF NOT EXISTS idx_mv_agent_final_branch
+  ON mv_sales_agent_final_branch (agent_name_final, branch);
+
+DROP MATERIALIZED VIEW IF EXISTS mv_sales_party_agent_branch;
+CREATE MATERIALIZED VIEW mv_sales_party_agent_branch AS
+SELECT
+  to_party_name,
+  agent_name_final,
+  branch,
+  SUM(net_amount) AS total_net,
+  SUM(amount_before_tax) AS total_tax,
+  SUM(sl_qty) AS total_qty,
+  COUNT(*)::bigint AS fact_row_count
+FROM sales_data
+GROUP BY 1, 2, 3;
+CREATE INDEX IF NOT EXISTS idx_mv_party_agent_branch
+  ON mv_sales_party_agent_branch (to_party_name, agent_name_final, branch);
+
 DROP MATERIALIZED VIEW IF EXISTS sales_mv;
 CREATE MATERIALIZED VIEW sales_mv AS
 SELECT
@@ -509,6 +538,64 @@ FROM sales_data
 GROUP BY 1, 2, 3, 4;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_mv_dims
   ON sales_mv (state, branch, brand, month);
+
+DROP MATERIALIZED VIEW IF EXISTS mv_sales_all_dims;
+CREATE MATERIALIZED VIEW mv_sales_all_dims AS
+SELECT
+  branch,
+  fy,
+  month,
+  mmm,
+  region,
+  state,
+  district,
+  city,
+  business_type,
+  agent_names_correction,
+  party_grouped,
+  party_name_for_count,
+  brand,
+  agent_name,
+  to_party_name,
+  bill_no,
+  bill_date,
+  item_no,
+  shade_name,
+  rate_unit,
+  size,
+  units_pack,
+  sl_qty,
+  gross_amount,
+  amount_before_tax,
+  net_amount,
+  sale_order_no,
+  sale_order_date,
+  item_with_shade,
+  item_category,
+  item_sub_cat,
+  so_type,
+  scheme,
+  goods_type,
+  agent_name_final,
+  pin_code,
+  created_at,
+  SUM(sl_qty) AS sum_sl_qty,
+  SUM(gross_amount) AS sum_gross_amount,
+  SUM(amount_before_tax) AS sum_amount_before_tax,
+  SUM(net_amount) AS sum_net_amount,
+  COUNT(*)::bigint AS fact_row_count
+FROM sales_data
+GROUP BY
+  branch, fy, month, mmm, region, state, district, city, business_type,
+  agent_names_correction, party_grouped, party_name_for_count, brand, agent_name,
+  to_party_name, bill_no, bill_date, item_no, shade_name, rate_unit, size, units_pack,
+  sl_qty, gross_amount, amount_before_tax, net_amount, sale_order_no, sale_order_date,
+  item_with_shade, item_category, item_sub_cat, so_type, scheme, goods_type,
+  agent_name_final, pin_code, created_at;
+CREATE INDEX IF NOT EXISTS idx_mv_sales_all_dims_common
+  ON mv_sales_all_dims (state, branch, brand, month);
+CREATE INDEX IF NOT EXISTS idx_mv_sales_all_dims_party
+  ON mv_sales_all_dims (to_party_name, agent_name_final, branch);
 
 -- -----------------------------------------------------------------------------
 -- Supabase RLS policies (anon access expected by this backend)

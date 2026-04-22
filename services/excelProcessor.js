@@ -470,6 +470,14 @@ const SUPABASE_IMPORT_RETRY_MAX =
     ? Math.min(6, Math.floor(Number(process.env.IMPORT_SUPABASE_RETRY_MAX)))
     : 3;
 
+function shouldRefreshPivotMvsAfterImport() {
+  return String(process.env.IMPORT_REFRESH_PIVOT_MVS || '1').trim() !== '0';
+}
+
+function shouldRefreshPivotMvsAsync() {
+  return String(process.env.IMPORT_REFRESH_PIVOT_MVS_ASYNC || '1').trim() !== '0';
+}
+
 function detectImportMode() {
   const envMode = String(process.env.IMPORT_INSERT_MODE || '').trim().toLowerCase();
   if (envMode === 'postgres_copy' || envMode === 'supabase_batch') return envMode;
@@ -1184,19 +1192,31 @@ async function runQueuedImportJob(job) {
       return;
     }
 
-    try {
-      await refreshPivotMVs();
-    } catch (e) {
-      logWarn('import', 'pivot MV refresh failed after import', {
-        jobId: job.jobId,
-        error: e?.message || String(e),
-      });
-    }
-
     job.status = 'completed';
     invalidateMasterCachePrefix('sales_data_count');
     job.completedAt = new Date();
     await updateJobInDb(job.jobId, job);
+
+    if (shouldRefreshPivotMvsAfterImport()) {
+      if (shouldRefreshPivotMvsAsync()) {
+        // Do not block import completion response on heavy MV refresh work.
+        void refreshPivotMVs().catch((e) => {
+          logWarn('import', 'pivot MV refresh failed after import', {
+            jobId: job.jobId,
+            error: e?.message || String(e),
+          });
+        });
+      } else {
+        try {
+          await refreshPivotMVs();
+        } catch (e) {
+          logWarn('import', 'pivot MV refresh failed after import', {
+            jobId: job.jobId,
+            error: e?.message || String(e),
+          });
+        }
+      }
+    }
   } catch (err) {
     logError('import', 'import failed', { jobId: job.jobId, message: err?.message, stack: err?.stack });
     job.status = 'failed';

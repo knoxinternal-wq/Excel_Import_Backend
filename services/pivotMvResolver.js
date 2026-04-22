@@ -52,6 +52,30 @@ const DEFAULT_REGISTRY = Object.freeze([
     disableGrandTotalBranchExclusion: true,
   },
   {
+    name: 'mv_sales_agent_final_branch',
+    relationEnv: 'PIVOT_MV_AGENT_FINAL_BRANCH',
+    defaultRelation: 'mv_sales_agent_final_branch',
+    dimensions: ['agent_name_final', 'branch'],
+    filterDimensions: ['agent_name_final', 'branch'],
+    measureMap: {
+      net_amount: 'total_net',
+      amount_before_tax: 'total_tax',
+      sl_qty: 'total_qty',
+    },
+  },
+  {
+    name: 'mv_sales_party_agent_branch',
+    relationEnv: 'PIVOT_MV_PARTY_AGENT_BRANCH',
+    defaultRelation: 'mv_sales_party_agent_branch',
+    dimensions: ['to_party_name', 'agent_name_final', 'branch'],
+    filterDimensions: ['to_party_name', 'agent_name_final', 'branch'],
+    measureMap: {
+      net_amount: 'total_net',
+      amount_before_tax: 'total_tax',
+      sl_qty: 'total_qty',
+    },
+  },
+  {
     name: 'mv_sales_agent_party_month',
     relationEnv: 'PIVOT_MV_AGENT_PARTY_MONTH',
     defaultRelation: 'mv_sales_agent_party_month',
@@ -81,7 +105,7 @@ const DEFAULT_REGISTRY = Object.freeze([
   {
     name: 'sales_pivot_mv',
     relationEnv: 'PIVOT_SOURCE_RELATION',
-    defaultRelation: '',
+    defaultRelation: 'mv_sales_all_dims',
     dimensions: [
       'branch', 'fy', 'month', 'mmm', 'region', 'state', 'district', 'city',
       'business_type', 'agent_names_correction', 'party_grouped', 'party_name_for_count',
@@ -107,10 +131,11 @@ const DEFAULT_REGISTRY = Object.freeze([
       'item_with_shade', 'item_category', 'item_sub_cat', 'so_type', 'scheme',
       'goods_type', 'agent_name_final', 'pin_code',
       'created_at',
-      'id',
     ],
     measureMap: {
       sl_qty: 'sum_sl_qty',
+      gross_amount: 'sum_gross_amount',
+      amount_before_tax: 'sum_amount_before_tax',
       net_amount: 'sum_net_amount',
     },
   },

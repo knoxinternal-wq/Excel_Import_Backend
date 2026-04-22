@@ -306,13 +306,13 @@ export async function queryDistinctPivotFilterValues(field, search = '', limit =
       params.push(`%${escapeIlike(term)}%`);
       extra = ` AND (${expr}) ILIKE $1 ESCAPE '\\'`;
     }
-    // DISTINCT + ORDER BY + LIMIT on MV sources keeps dropdowns fast on large facts.
+    // Keep this unsorted so Postgres can stop earlier with LIMIT on large sources.
+    // Sorting is handled in pivotService before returning to the client.
     const sql = `
       SELECT DISTINCT ${expr} AS v
       ${fromSql}
       WHERE ${expr} IS NOT NULL AND ${expr} <> ''
       ${extra}
-      ORDER BY 1
       LIMIT ${lim}
     `;
     const { rows } = await client.query(sql, params);
@@ -417,6 +417,10 @@ function quoteRelationIdent(name) {
 
 function resolveDistinctSource(field) {
   const byName = Object.fromEntries(getMvRegistry().map((mv) => [mv.name, mv]));
+  const allDims = byName.sales_pivot_mv;
+  if (allDims?.dimensions?.includes(field)) {
+    return { relation: allDims.relation, expr: `mv.${quoteIdent(field)}` };
+  }
   if (field === 'branch' && byName.mv_sales_branch_brand) {
     return { relation: byName.mv_sales_branch_brand.relation, expr: 'mv."branch"' };
   }

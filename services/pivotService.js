@@ -62,6 +62,20 @@ function getPivotCardinalityWarnings(rows, columns) {
   return warnings;
 }
 
+function assertPivotCardinalityPreflight(normalized) {
+  const axes = [...(normalized.rows || []), ...(normalized.columns || [])];
+  if (!axes.length) return;
+  const hasAnyFilter = Array.isArray(normalized.filters) && normalized.filters.length > 0;
+  if (hasAnyFilter) return;
+  const highCount = axes.filter((f) => HIGH_CARDINALITY_PIVOT_FIELDS.has(f)).length;
+  const hasExplosiveField = axes.includes('item_no') || axes.includes('bill_no');
+  if (highCount >= 2 || (hasExplosiveField && axes.length >= 3)) {
+    throw new Error(
+      'Pivot layout is too wide for unfiltered raw fields. Add at least one filter or reduce high-cardinality row/column fields (item_no, bill_no, party fields).',
+    );
+  }
+}
+
 /** When no Postgres pool, these stay in-memory; with `DATABASE_URL` they map to SQL + PostgREST. */
 const SQL_DEFER_OPS = new Set(['is_blank', 'is_not_blank']);
 
@@ -84,6 +98,17 @@ const MAX_PIVOT_VISIBLE_CELLS = Math.max(
   50_000,
   Number(process.env.PIVOT_MAX_VISIBLE_CELLS) || 250_000,
 );
+
+function assertVisibleCellLimit(rowCount, colCount, metricCount) {
+  const safeRowCount = Math.max(1, Number(rowCount) || 1);
+  const safeColCount = Math.max(1, Number(colCount) || 1);
+  const safeMetricCount = Math.max(1, Number(metricCount) || 1);
+  const visibleCells = safeRowCount * safeColCount * safeMetricCount;
+  if (visibleCells <= MAX_PIVOT_VISIBLE_CELLS) return;
+  throw new Error(
+    `Pivot too large (${safeRowCount.toLocaleString('en-IN')} rows × ${safeColCount.toLocaleString('en-IN')} columns × ${safeMetricCount.toLocaleString('en-IN')} value(s) = ${visibleCells.toLocaleString('en-IN')} cells; limit ${MAX_PIVOT_VISIBLE_CELLS.toLocaleString('en-IN')}). Reduce row/column fields or apply filters.`,
+  );
+}
 
 function pivotResultCacheKey(normalized) {
   return JSON.stringify({
@@ -976,6 +1001,7 @@ async function runPivotWithPostgres(normalized, sqlFilters, values, metricKeys) 
 
     if (!rowHeadersMap.has(rowKey)) rowHeadersMap.set(rowKey, { key: rowKey, labels: rowLabels });
     if (!colHeadersMap.has(colKey)) colHeadersMap.set(colKey, { key: colKey, labels: colLabels });
+    assertVisibleCellLimit(rowHeadersMap.size, colHeadersMap.size, metricKeys.length);
 
     const metricMap = materializeBucketsFromSqlRow(raw, values);
     if (!cellMap.has(rowKey)) cellMap.set(rowKey, new Map());
@@ -1019,6 +1045,7 @@ async function runPivotWithStream(normalized, sqlFilters, memFilters, values, me
       const colKey = keyFromParts(colLabels);
       if (!rowHeadersMap.has(rowKey)) rowHeadersMap.set(rowKey, { key: rowKey, labels: rowLabels });
       if (!colHeadersMap.has(colKey)) colHeadersMap.set(colKey, { key: colKey, labels: colLabels });
+      assertVisibleCellLimit(rowHeadersMap.size, colHeadersMap.size, metricKeys.length);
       const metricMap = ensureCell(cellMap, rowKey, colKey);
       values.forEach((v) => addValue(metricMap, `${v.agg}:${v.field}`, row[v.field], v.field));
     }
@@ -1051,6 +1078,7 @@ export function getPivotCapabilities() {
 
 export async function runPivot(config = {}) {
   const normalized = normalizeConfig(config);
+  assertPivotCardinalityPreflight(normalized);
   if (!normalized.values.length) {
     throw new Error('Add at least one field to Rows, Columns, or Values.');
   }
