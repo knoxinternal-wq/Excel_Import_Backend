@@ -64,6 +64,9 @@ export async function login(req, res) {
       },
     });
   } catch (err) {
+    if (err?.code === 'AUTH_LOOKUP_TIMEOUT') {
+      return res.status(503).json({ error: 'Login service temporarily unavailable. Please retry.' });
+    }
     return res.status(500).json({ error: err?.message || 'Login failed' });
   }
 }
