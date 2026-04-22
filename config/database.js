@@ -5,7 +5,7 @@
  */
 import pg from 'pg';
 import pgConnString from 'pg-connection-string';
-import { logError } from '../utils/logger.js';
+import { logError, logWarn } from '../utils/logger.js';
 
 /** @type {import('pg').Pool | null} */
 let pool = null;
@@ -100,18 +100,31 @@ export function buildPgConfigFromUrl(connectionString) {
   return cfg;
 }
 
-function poolMaxConnections() {
+function poolMaxConnections(connectionString = '') {
+  const dbUrl = String(connectionString || getDatabaseUrl());
+  const sessionMode = isSupavisorSessionModeUrl(dbUrl);
   const raw = String(process.env.PG_POOL_MAX || '').trim();
   const n = raw ? Number(raw) : NaN;
-  if (Number.isFinite(n) && n >= 1) return Math.min(50, Math.floor(n));
-  return 20;
+  if (Number.isFinite(n) && n >= 1) {
+    const requested = Math.min(50, Math.floor(n));
+    if (sessionMode) return Math.min(10, requested);
+    return requested;
+  }
+  // Session mode is strict (max clients ~= pool_size). Keep backend fan-out conservative by default.
+  return sessionMode ? 8 : 20;
 }
 
-function poolMinConnections() {
+function poolMinConnections(connectionString = '') {
+  const dbUrl = String(connectionString || getDatabaseUrl());
+  const sessionMode = isSupavisorSessionModeUrl(dbUrl);
   const raw = String(process.env.PG_POOL_MIN || '').trim();
   const n = raw ? Number(raw) : NaN;
-  if (Number.isFinite(n) && n >= 0) return Math.min(20, Math.floor(n));
-  return 4;
+  if (Number.isFinite(n) && n >= 0) {
+    const requested = Math.min(20, Math.floor(n));
+    if (sessionMode) return Math.min(2, requested);
+    return requested;
+  }
+  return sessionMode ? 0 : 4;
 }
 
 function poolConnectionTimeoutMs() {
@@ -124,17 +137,38 @@ function poolConnectionTimeoutMs() {
  * @returns {import('pg').PoolConfig}
  */
 export function buildPoolConfigFromUrl(connectionString) {
+  const sessionMode = isSupavisorSessionModeUrl(connectionString);
   const base = buildPgConfigFromUrl(connectionString);
   return {
     ...base,
-    max: poolMaxConnections(),
-    min: poolMinConnections(),
+    max: poolMaxConnections(connectionString),
+    min: poolMinConnections(connectionString),
     idleTimeoutMillis: Number(process.env.PG_POOL_IDLE_MS) > 0
       ? Math.floor(Number(process.env.PG_POOL_IDLE_MS))
       : 30_000,
     connectionTimeoutMillis: poolConnectionTimeoutMs(),
     allowExitOnIdle: false,
   };
+}
+
+/**
+ * Supabase Supavisor session mode uses port 5432 on pooler host.
+ * In this mode, each checked-out client occupies a backend connection,
+ * so low app-side pool concurrency prevents MaxClientsInSessionMode errors.
+ * @param {string} connectionString
+ * @returns {boolean}
+ */
+function isSupavisorSessionModeUrl(connectionString) {
+  if (!connectionString) return false;
+  try {
+    const normalized = String(connectionString).replace(/^postgres:\/\//i, 'postgresql://');
+    const u = new URL(normalized);
+    const host = String(u.hostname || '').toLowerCase();
+    const port = String(u.port || '');
+    return host.includes('pooler.supabase.com') && (port === '' || port === '5432');
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -146,7 +180,15 @@ export function getPgPool() {
   const url = getDatabaseUrl();
   if (!url) return null;
   if (!pool) {
-    pool = new pg.Pool(buildPoolConfigFromUrl(url));
+    const poolCfg = buildPoolConfigFromUrl(url);
+    if (isSupavisorSessionModeUrl(url)) {
+      logWarn('db', 'Supabase session pooler detected; using conservative app pool defaults', {
+        max: poolCfg.max,
+        min: poolCfg.min,
+        suggestion: 'Use transaction mode pooler URL on port 6543 for higher concurrency.',
+      });
+    }
+    pool = new pg.Pool(poolCfg);
     pool.on('error', (err) => {
       logError('db', 'PostgreSQL pool error', { message: err?.message, code: err?.code });
     });
