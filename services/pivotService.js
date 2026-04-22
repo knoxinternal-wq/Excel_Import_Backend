@@ -63,13 +63,17 @@ function getPivotCardinalityWarnings(rows, columns) {
 }
 
 function assertPivotCardinalityPreflight(normalized) {
+  if (String(process.env.PIVOT_PREFLIGHT_BLOCK_WIDE || '1').trim() === '0') return;
   const axes = [...(normalized.rows || []), ...(normalized.columns || [])];
   if (!axes.length) return;
   const hasAnyFilter = Array.isArray(normalized.filters) && normalized.filters.length > 0;
   if (hasAnyFilter) return;
   const highCount = axes.filter((f) => HIGH_CARDINALITY_PIVOT_FIELDS.has(f)).length;
   const hasExplosiveField = axes.includes('item_no') || axes.includes('bill_no');
-  if (highCount >= 2 || (hasExplosiveField && axes.length >= 3)) {
+  // Only hard-block very high-risk unfiltered layouts that are known to explode cardinality.
+  const clearlyExplosive = hasExplosiveField && axes.length >= 3;
+  const tooManyRawHighCardAxes = highCount >= 3 && axes.length >= 4;
+  if (clearlyExplosive || tooManyRawHighCardAxes) {
     throw new Error(
       'Pivot layout is too wide for unfiltered raw fields. Add at least one filter or reduce high-cardinality row/column fields (item_no, bill_no, party fields).',
     );
