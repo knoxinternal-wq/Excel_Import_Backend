@@ -263,7 +263,7 @@ function buildColumnHeaderRows(columnHeaders = []) {
 const PIVOT_BODY_PAGE_SIZE = 100;
 /** Default / minimum row height before dynamic measure (wrapped text grows rows). */
 const PIVOT_BODY_ROW_HEIGHT = 36;
-const FILTER_RUN_DEBOUNCE_MS = 350;
+const FILTER_RUN_DEBOUNCE_MS = 220;
 /** Longer TTL repeats same layout/filter faster without hitting the API. */
 const PIVOT_CLIENT_CACHE_TTL_MS = 120_000;
 const FILTER_VALUES_LIMIT = 500;

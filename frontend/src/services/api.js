@@ -47,7 +47,7 @@ const longOpts = () => ({ timeout: LONG_RUNNING_REQUEST_MS });
  * Synchronous read of cached filter distinct values (same key as filterValues).
  * Lets the UI paint options immediately on repeat visits without waiting on the network.
  */
-export function peekPivotFilterValuesCache(field, search = '', limit = 10_000) {
+export function peekPivotFilterValuesCache(field, search = '', limit = 500) {
   const f = String(field || '').trim();
   if (!f) return null;
   const searchRaw = String(search || '').trim();
@@ -115,10 +115,11 @@ export const pivotApi = {
       ...(requestConfig || {}),
     }),
   fields: () => axios.get(`${API_BASE}/data/report/fields`, fastOpts()),
+  capabilities: () => axios.get(`${API_BASE}/data/report/capabilities`, fastOpts()),
   filterValues: async (params = {}) => {
     const field = String(params?.field || '').trim();
     const searchRaw = String(params?.search || '').trim();
-    const limit = params?.limit ?? 10000;
+    const limit = params?.limit ?? 500;
     const cacheKey = JSON.stringify({ field, search: searchRaw.toLowerCase(), limit });
     const now = Date.now();
 

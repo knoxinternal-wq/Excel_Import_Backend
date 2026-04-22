@@ -275,10 +275,18 @@ CREATE INDEX IF NOT EXISTS idx_sales_data_fy_btrim
 CREATE INDEX IF NOT EXISTS idx_sales_data_month_btrim
   ON sales_data ((BTRIM(month::text)))
   WHERE month IS NOT NULL AND BTRIM(month::text) <> '';
+CREATE INDEX IF NOT EXISTS idx_sales_data_party_grouped_btrim
+  ON sales_data ((BTRIM(COALESCE(party_grouped::text, ''))));
+CREATE INDEX IF NOT EXISTS idx_sales_data_agent_name_btrim
+  ON sales_data ((BTRIM(COALESCE(agent_name::text, ''))));
+CREATE INDEX IF NOT EXISTS idx_sales_data_to_party_name_btrim
+  ON sales_data ((BTRIM(COALESCE(to_party_name::text, ''))));
 CREATE INDEX IF NOT EXISTS idx_sales_data_state_brand_partial
   ON sales_data (state, brand) WHERE state IS NOT NULL AND brand IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sales_data_brand_month_partial
   ON sales_data (brand, month) WHERE brand IS NOT NULL AND month IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sales_data_party_grouped_brand_btrim
+  ON sales_data ((BTRIM(COALESCE(party_grouped::text, ''))), (BTRIM(COALESCE(brand::text, ''))));
 
 -- -----------------------------------------------------------------------------
 -- Operational tables used by backend
@@ -457,6 +465,35 @@ GROUP BY 1, 2, 3;
 CREATE INDEX IF NOT EXISTS idx_mv_agent_party_month
   ON mv_sales_agent_party_month (agent_name, to_party_name, month);
 
+DROP MATERIALIZED VIEW IF EXISTS mv_sales_party_grouped_brand;
+CREATE MATERIALIZED VIEW mv_sales_party_grouped_brand AS
+SELECT
+  party_grouped,
+  brand,
+  SUM(net_amount) AS total_net,
+  SUM(amount_before_tax) AS total_tax,
+  SUM(sl_qty) AS total_qty,
+  COUNT(*)::bigint AS fact_row_count
+FROM sales_data
+GROUP BY 1, 2;
+CREATE INDEX IF NOT EXISTS idx_mv_party_grouped_brand
+  ON mv_sales_party_grouped_brand (party_grouped, brand);
+
+DROP MATERIALIZED VIEW IF EXISTS mv_sales_state_party_grouped_brand;
+CREATE MATERIALIZED VIEW mv_sales_state_party_grouped_brand AS
+SELECT
+  state,
+  party_grouped,
+  brand,
+  SUM(net_amount) AS total_net,
+  SUM(amount_before_tax) AS total_tax,
+  SUM(sl_qty) AS total_qty,
+  COUNT(*)::bigint AS fact_row_count
+FROM sales_data
+GROUP BY 1, 2, 3;
+CREATE INDEX IF NOT EXISTS idx_mv_state_party_grouped_brand
+  ON mv_sales_state_party_grouped_brand (state, party_grouped, brand);
+
 DROP MATERIALIZED VIEW IF EXISTS sales_mv;
 CREATE MATERIALIZED VIEW sales_mv AS
 SELECT
@@ -465,6 +502,8 @@ SELECT
   brand,
   DATE_TRUNC('month', bill_date::timestamp)::date AS month,
   SUM(net_amount) AS total,
+  SUM(amount_before_tax) AS total_tax,
+  SUM(sl_qty) AS total_qty,
   COUNT(*)::bigint AS fact_row_count
 FROM sales_data
 GROUP BY 1, 2, 3, 4;
