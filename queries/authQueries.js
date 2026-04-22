@@ -1,4 +1,5 @@
 import { getPgPool } from '../config/database.js';
+import { supabase, supabaseAdmin } from '../models/supabase.js';
 import { logError } from '../utils/logger.js';
 
 const USER_CACHE_TTL_MS = Number(process.env.AUTH_USER_CACHE_TTL_MS) || 10 * 60 * 1000;
@@ -34,6 +35,18 @@ async function fetchUserFromPg(normalized) {
   return rows?.[0] ?? null;
 }
 
+async function fetchUserFromSupabase(normalized) {
+  const client = supabaseAdmin || supabase;
+  const { data, error } = await client
+    .from('app_users')
+    .select('id, email, password, full_name, is_active, is_admin, last_login_at')
+    .eq('email', normalized)
+    .eq('is_active', true)
+    .limit(1);
+  if (error) throw new Error(error.message || 'Supabase auth lookup failed');
+  return data?.[0] ?? null;
+}
+
 export async function findUserByEmail(email) {
   const normalized = normalizeEmail(email);
   if (!normalized) return null;
@@ -49,13 +62,35 @@ export async function findUserByEmail(email) {
   }
 
   const p = (async () => {
-    const pgUser = await withTimeout(fetchUserFromPg(normalized), AUTH_LOOKUP_TIMEOUT_MS);
-    if (pgUser === AUTH_TIMEOUT) {
-      const err = new Error('Auth lookup timed out');
-      err.code = 'AUTH_LOOKUP_TIMEOUT';
-      throw err;
+    try {
+      const pgUser = await withTimeout(fetchUserFromPg(normalized), AUTH_LOOKUP_TIMEOUT_MS);
+      if (pgUser !== AUTH_TIMEOUT) return pgUser;
+      logError('auth', 'findUserByEmail timeout on pg lookup; trying supabase fallback', {
+        email: normalized,
+      });
+    } catch (e) {
+      logError('auth', 'findUserByEmail pg lookup failed; trying supabase fallback', {
+        email: normalized,
+        message: e?.message,
+        code: e?.code,
+      });
     }
-    return pgUser;
+
+    try {
+      const sbUser = await withTimeout(fetchUserFromSupabase(normalized), AUTH_LOOKUP_TIMEOUT_MS);
+      if (sbUser === AUTH_TIMEOUT) {
+        logError('auth', 'findUserByEmail timeout on supabase fallback', { email: normalized });
+        return null;
+      }
+      return sbUser;
+    } catch (e) {
+      logError('auth', 'findUserByEmail supabase fallback failed', {
+        email: normalized,
+        message: e?.message,
+        code: e?.code,
+      });
+      return null;
+    }
   })();
 
   userInflight.set(normalized, p);
@@ -65,12 +100,6 @@ export async function findUserByEmail(email) {
     if (!user) return null;
     userCache.set(normalized, { ts: now, user });
     return user;
-  } catch (e) {
-    logError('auth', 'findUserByEmail failed', {
-      message: e?.message,
-      code: e?.code,
-    });
-    throw e;
   } finally {
     userInflight.delete(normalized);
   }
