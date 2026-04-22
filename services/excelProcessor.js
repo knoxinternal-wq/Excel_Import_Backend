@@ -32,6 +32,7 @@ import { logError, logWarn, logDebug, logInfo } from '../utils/logger.js';
 import { parseExcelMoneyQtyCell, parseFactNumeric } from '../utils/salesFacts.js';
 import { invalidateMasterCachePrefix } from './masterLookupCache.js';
 import { getPgPool } from '../config/database.js';
+import { refreshPivotMVs } from './pivotMvRefresh.js';
 
 const NUMERIC_FIELDS_SET = new Set(NUMERIC_FIELDS);
 const DATE_FIELDS_SET = new Set(DATE_FIELDS);
@@ -1181,6 +1182,15 @@ async function runQueuedImportJob(job) {
       await updateJobInDb(job.jobId, job);
       invalidateMasterCachePrefix('sales_data_count');
       return;
+    }
+
+    try {
+      await refreshPivotMVs();
+    } catch (e) {
+      logWarn('import', 'pivot MV refresh failed after import', {
+        jobId: job.jobId,
+        error: e?.message || String(e),
+      });
     }
 
     job.status = 'completed';

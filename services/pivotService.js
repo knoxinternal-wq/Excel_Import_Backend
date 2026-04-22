@@ -12,12 +12,13 @@ import {
   queryDrilldownPage,
 } from './pivotSql.js';
 import PQueue from 'p-queue';
-import { logDebug } from '../utils/logger.js';
+import { logDebug, logInfo, logWarn } from '../utils/logger.js';
 import {
   isPivotRedisConfigured,
   pivotRedisGet,
   pivotRedisSet,
 } from './pivotRedisCache.js';
+import { getPivotCapabilities as buildPivotCapabilities } from './pivotMvResolver.js';
 
 const SALES_FIELDS = [
   'id',
@@ -943,7 +944,7 @@ function assemblePivotFromCellMap(
 }
 
 async function runPivotWithPostgres(normalized, sqlFilters, values, metricKeys) {
-  const { rows: sqlRows, filteredRowCount } = await queryPivotGroupBy(
+  const { rows: sqlRows, filteredRowCount, execution } = await queryPivotGroupBy(
     normalized,
     pivotPostgresWhereFilters(normalized, sqlFilters),
   );
@@ -981,7 +982,7 @@ async function runPivotWithPostgres(normalized, sqlFilters, values, metricKeys) 
     cellMap.get(rowKey).set(colKey, metricMap);
   }
 
-  return assemblePivotFromCellMap(
+  const assembled = assemblePivotFromCellMap(
     normalized,
     values,
     metricKeys,
@@ -991,6 +992,10 @@ async function runPivotWithPostgres(normalized, sqlFilters, values, metricKeys) 
     filteredRowCount,
     filteredRowCount,
   );
+  return {
+    ...assembled,
+    _sqlExecution: execution || { type: 'GROUP_BY' },
+  };
 }
 
 async function runPivotWithStream(normalized, sqlFilters, memFilters, values, metricKeys) {
@@ -1040,6 +1045,10 @@ export function getPivotFields() {
   }));
 }
 
+export function getPivotCapabilities() {
+  return buildPivotCapabilities();
+}
+
 export async function runPivot(config = {}) {
   const normalized = normalizeConfig(config);
   if (!normalized.values.length) {
@@ -1071,6 +1080,14 @@ export async function runPivot(config = {}) {
 
   const sqlDetails = getPivotSqlAggregationDetails(normalized, memFilters);
   const usePostgresPivot = sqlDetails.eligible;
+  const hasPostgresPool = Boolean(getPivotSqlPool());
+  if (hasPostgresPool && !usePostgresPivot) {
+    logWarn('pivot', 'PIVOT_FALLBACK', {
+      reason: sqlDetails.reasons?.[0] || 'postgres_not_eligible',
+      reasons: sqlDetails.reasons || [],
+      config: normalized,
+    });
+  }
 
   if (String(process.env.PIVOT_DEBUG_ENGINE || '').trim() === '1') {
     const dimCount = (normalized.rows?.length || 0) + (normalized.columns?.length || 0);
@@ -1092,6 +1109,7 @@ export async function runPivot(config = {}) {
     ? await runPivotWithPostgres(normalized, sqlFilters, values, metricKeys)
     : await runPivotWithStream(normalized, sqlFilters, memFilters, values, metricKeys);
   const executionMs = Date.now() - t0;
+  const sqlExecution = result?._sqlExecution || null;
 
   const cardinalityWarnings = getPivotCardinalityWarnings(normalized.rows, normalized.columns);
 
@@ -1104,7 +1122,17 @@ export async function runPivot(config = {}) {
     ...(!usePostgresPivot && sqlDetails.reasons?.length
       ? { engineReasons: sqlDetails.reasons, streamFallbackReason: sqlDetails.reasons[0] }
       : {}),
+    ...(sqlExecution?.type === 'MV' ? { mv: sqlExecution.mv, mvRelation: sqlExecution.relation } : {}),
   };
+
+  logInfo('pivot', 'PIVOT_EXECUTION', {
+    type: sqlExecution?.type || (usePostgresPivot ? 'GROUP_BY' : 'STREAM'),
+    mv: sqlExecution?.mv || null,
+    duration_ms: executionMs,
+    rows: normalized.rows,
+    columns: normalized.columns,
+    values: normalized.values,
+  });
 
   if (String(process.env.PIVOT_DEBUG_ENGINE || '').trim() === '1') {
     console.log('PIVOT META:', {
@@ -1115,7 +1143,7 @@ export async function runPivot(config = {}) {
   }
 
   try {
-    const { _helpers: _discard, ...payload } = result;
+    const { _helpers: _discard, _sqlExecution: _discardExec, ...payload } = result;
     pivotResultCache.set(pCacheKey, { t: Date.now(), payload });
     if (isPivotRedisConfigured()) {
       void pivotRedisSet(pCacheKey, payload);

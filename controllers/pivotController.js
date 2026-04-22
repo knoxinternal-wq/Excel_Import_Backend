@@ -1,6 +1,7 @@
 import ExcelJS from 'exceljs';
 import {
   getPivotFields,
+  getPivotCapabilities,
   runPivot,
   runDrilldown,
   toDisplayNumber,
@@ -142,6 +143,15 @@ export async function getPivotFieldsHandler(req, res) {
   try {
     res.set('Cache-Control', 'public, max-age=300');
     res.json({ fields: getPivotFields() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+export async function getPivotCapabilitiesHandler(req, res) {
+  try {
+    res.set('Cache-Control', 'public, max-age=120');
+    res.json(getPivotCapabilities());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

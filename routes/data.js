@@ -9,6 +9,7 @@ import {
 import { getReportMeta } from '../controllers/reportController.js';
 import {
   getPivotFieldsHandler,
+  getPivotCapabilitiesHandler,
   getPivotFilterValuesHandler,
   getPivotFilterValuesBatchHandler,
   getPivotDataHandler,
@@ -33,6 +34,7 @@ router.post('/delete-range/preview', previewDeleteByDateRange);
 router.delete('/delete-range', deleteByDateRange);
 router.get('/report/meta', getReportMeta);
 router.get('/report/fields', cacheControl('public,max-age=3600'), getPivotFieldsHandler);
+router.get('/report/capabilities', cacheControl('public,max-age=120'), getPivotCapabilitiesHandler);
 router.get('/report/filter-values', cacheControl('public,max-age=300,stale-while-revalidate=60'), getPivotFilterValuesHandler);
 router.post('/report/filter-values-batch', getPivotFilterValuesBatchHandler);
 router.post('/report/pivot', getPivotDataHandler);
