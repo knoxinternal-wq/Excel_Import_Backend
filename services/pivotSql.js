@@ -71,9 +71,23 @@ function getMaxGroupDimensions() {
 }
 
 const MAX_VALUE_SPECS = 12;
+const DEFAULT_PIVOT_MAX_GROUP_ROWS = 80_000;
 const FILTER_VALUES_CACHE_TTL_MS = Number(process.env.PIVOT_FILTER_VALUES_CACHE_TTL_MS) || 30 * 60 * 1000;
 const FILTER_VALUES_CACHE_MAX = Number(process.env.PIVOT_FILTER_VALUES_CACHE_MAX) || 100;
 const filterValuesCache = new Map();
+
+function getPivotMaxGroupRows() {
+  const n = Number(process.env.PIVOT_MAX_GROUP_ROWS);
+  if (Number.isFinite(n) && n >= 1_000) return Math.min(500_000, Math.floor(n));
+  return DEFAULT_PIVOT_MAX_GROUP_ROWS;
+}
+
+function assertGroupRowsWithinLimit(rows, limit, contextLabel) {
+  if ((rows?.length || 0) <= limit) return;
+  throw new Error(
+    `Pivot grouping produced too many rows (> ${limit.toLocaleString('en-IN')}) for ${contextLabel}. Add filters or reduce high-cardinality fields.`,
+  );
+}
 
 /** Pivot aggregation timeout: disabled (0) to avoid app-level cutoff on heavy SQL pivots. */
 function getPivotAggregationTimeoutMs() {
@@ -884,15 +898,18 @@ async function queryPivotFromResolvedMv(mv, normalized, sqlFilters) {
     'mv',
     { excludeGrandTotalBranch: mv.disableGrandTotalBranchExclusion !== true },
   );
+  const maxGroupRows = getPivotMaxGroupRows();
   const groupClause = groupDim.length ? `GROUP BY ${groupDim.map((_, i) => i + 1).join(', ')}` : '';
   const sql = `
     SELECT ${[...selectDim, ...aggSelects].join(',\n      ')}
     FROM ${mvRel} mv
     ${whereSql}
     ${groupClause}
+    LIMIT ${maxGroupRows + 1}
   `.trim();
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
+    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, `MV ${mv.name}`);
     await maybeLogPivotSqlExplain(client, mv.name, sql, params);
     const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
     return {
@@ -1057,6 +1074,7 @@ async function queryPivotFromStateMonthMv(normalized, sqlFilters) {
     'mv',
     { excludeGrandTotalBranch: false },
   );
+  const maxGroupRows = getPivotMaxGroupRows();
   const sql = `
     SELECT
       mv.state AS dr_0,
@@ -1064,9 +1082,11 @@ async function queryPivotFromStateMonthMv(normalized, sqlFilters) {
       ${aggSelects.join(',\n      ')}
     FROM ${mvRel} mv
     ${whereSql}
+    LIMIT ${maxGroupRows + 1}
   `.trim();
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
+    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV mv_state_month');
     await maybeLogPivotSqlExplain(client, 'mv_state_month', sql, params);
     const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
     return { rows: groupRes.rows, filteredRowCount };
@@ -1103,6 +1123,7 @@ async function queryPivotFromBranchBrandMv(normalized, sqlFilters) {
     aggSelects.push(`mv.fact_row_count AS agg_rowcnt_${vi}`);
   });
   const { whereSql, params } = buildWhereFromSqlFilters(sqlFilters, 'mv');
+  const maxGroupRows = getPivotMaxGroupRows();
   const sql = `
     SELECT
       mv.branch AS dr_0,
@@ -1110,9 +1131,11 @@ async function queryPivotFromBranchBrandMv(normalized, sqlFilters) {
       ${aggSelects.join(',\n      ')}
     FROM ${mvRel} mv
     ${whereSql}
+    LIMIT ${maxGroupRows + 1}
   `.trim();
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
+    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV mv_branch_brand');
     await maybeLogPivotSqlExplain(client, 'mv_branch_brand', sql, params);
     const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
     return { rows: groupRes.rows, filteredRowCount };
@@ -1182,6 +1205,7 @@ async function queryPivotFromAgentPartyMonthMv(normalized, sqlFilters) {
     'mv',
     { excludeGrandTotalBranch: false },
   );
+  const maxGroupRows = getPivotMaxGroupRows();
   const groupClause = groupDims.length ? `GROUP BY ${groupDims.map((_, i) => i + 1).join(', ')}` : '';
   const sql = `
     SELECT
@@ -1190,9 +1214,11 @@ async function queryPivotFromAgentPartyMonthMv(normalized, sqlFilters) {
     FROM ${mvRel} mv
     ${whereSql}
     ${groupClause}
+    LIMIT ${maxGroupRows + 1}
   `.trim();
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
+    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV mv_agent_party_month');
     await maybeLogPivotSqlExplain(client, 'mv_agent_party_month_rollup', sql, params);
     const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
     return { rows: groupRes.rows, filteredRowCount };
@@ -1206,6 +1232,7 @@ async function queryPivotFromSalesMv(sqlFilters, values) {
   const mvName = process.env.PIVOT_MV_SALES || 'sales_mv';
   const mvRel = quoteMvName(mvName);
   const { whereSql, params } = buildWhereFromSqlFilters(sqlFilters, 'mv');
+  const maxGroupRows = getPivotMaxGroupRows();
   const groupSql = `
     SELECT
       mv.state AS dr_0,
@@ -1216,10 +1243,12 @@ async function queryPivotFromSalesMv(sqlFilters, values) {
       mv.fact_row_count AS agg_rowcnt_0
     FROM ${mvRel} mv
     ${whereSql}
+    LIMIT ${maxGroupRows + 1}
   `.trim();
 
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(groupSql, params);
+    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV sales_mv');
     await maybeLogPivotSqlExplain(client, 'sales_mv', groupSql, params);
     const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
     return { rows: groupRes.rows, filteredRowCount };
@@ -1331,6 +1360,7 @@ export async function queryPivotGroupBy(normalized, sqlFilters) {
   });
 
   const { whereSql, params } = buildWhereFromSqlFilters(sqlFilters);
+  const maxGroupRows = getPivotMaxGroupRows();
   const groupClause = groupDim.length ? `GROUP BY ${groupDim.map((_, i) => i + 1).join(', ')}` : '';
 
   const sql = `
@@ -1338,10 +1368,12 @@ export async function queryPivotGroupBy(normalized, sqlFilters) {
     FROM sales_data sd
     ${whereSql}
     ${groupClause}
+    LIMIT ${maxGroupRows + 1}
   `.trim();
 
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
+    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'sales_data group-by');
     await maybeLogPivotSqlExplain(client, 'sales_data_groupby', sql, params);
     const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
     return {
