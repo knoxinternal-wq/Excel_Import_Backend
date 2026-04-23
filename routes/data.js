@@ -21,7 +21,6 @@ import { requireAuthSession } from '../middleware/authenticateSession.js';
 import { requireAdmin } from '../middleware/requireAdmin.js';
 
 const router = express.Router();
-router.use(requireAuthSession);
 
 function cacheControl(v) {
   return (req, res, next) => {
@@ -33,8 +32,8 @@ function cacheControl(v) {
 router.get('/', cacheControl('private,no-store'), getData);
 router.get('/states', cacheControl('public,max-age=300'), getStates);
 router.get('/filter-options', getFilterOptions);
-router.post('/delete-range/preview', requireAdmin, previewDeleteByDateRange);
-router.delete('/delete-range', requireAdmin, deleteByDateRange);
+router.post('/delete-range/preview', requireAuthSession, requireAdmin, previewDeleteByDateRange);
+router.delete('/delete-range', requireAuthSession, requireAdmin, deleteByDateRange);
 router.get('/report/meta', getReportMeta);
 router.get('/report/fields', cacheControl('public,max-age=3600'), getPivotFieldsHandler);
 router.get('/report/capabilities', cacheControl('public,max-age=120'), getPivotCapabilitiesHandler);

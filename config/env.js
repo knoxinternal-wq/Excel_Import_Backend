@@ -35,11 +35,13 @@ export function validateEnvironment() {
   }
 
   if (!has(process.env.AUTH_SESSION_SECRET)) {
+    const hasServiceRole =
+      has(process.env.SUPABASE_SERVICE_ROLE_KEY) || has(process.env.SERVICE_ROLE_KEY);
     if (isProduction()) {
       errors.push('Missing AUTH_SESSION_SECRET in production.');
-    } else {
+    } else if (!hasServiceRole) {
       warnings.push(
-        'AUTH_SESSION_SECRET is not set; auth falls back to service-role key in development.',
+        'AUTH_SESSION_SECRET is not set and no service-role fallback key is available.',
       );
     }
   }
