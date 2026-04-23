@@ -4,7 +4,6 @@ store/
 import-tmp/
 *.log
 .env
-.env.example
 
 # IDE/editor
 .vscode/
@@ -13,4 +12,8 @@ import-tmp/
 # OS
 Thumbs.db
 .DS_Store
+
+# Supabase local temp/link artifacts
+supabase/.temp/
+backend/supabase/.temp/
 

@@ -436,10 +436,15 @@ const JOB_UPDATE_EVERY_N_ROWS =
     : 100_000;
 
 /** Parallel CSV shards + concurrent COPY sessions (import tab only). Set to 1 to use single-stream COPY. */
+function isSessionPoolerDbUrl() {
+  const raw = String(process.env.DATABASE_URL || '').toLowerCase();
+  return raw.includes('pooler.supabase.com') && (raw.includes(':5432') || !raw.includes(':6543'));
+}
+
 const IMPORT_COPY_PARALLEL =
   Number(process.env.IMPORT_COPY_PARALLEL) > 0
     ? Math.min(8, Math.max(1, Math.floor(Number(process.env.IMPORT_COPY_PARALLEL))))
-    : 4;
+    : (isSessionPoolerDbUrl() ? 1 : 4);
 
 /**
  * When true (default): single COPY stream only — if import fails, Postgres rolls back that COPY (no partial rows).
@@ -460,7 +465,7 @@ const SUPABASE_IMPORT_BATCH_SIZE =
 const SUPABASE_IMPORT_BATCH_CONCURRENCY =
   Number(process.env.IMPORT_SUPABASE_BATCH_CONCURRENCY) > 0
     ? Math.min(12, Math.floor(Number(process.env.IMPORT_SUPABASE_BATCH_CONCURRENCY)))
-    : 3;
+    : (isSessionPoolerDbUrl() ? 2 : 3);
 const SUPABASE_IMPORT_TIMEOUT_MIN_BATCH =
   Number(process.env.IMPORT_SUPABASE_TIMEOUT_MIN_BATCH) > 0
     ? Math.max(50, Math.floor(Number(process.env.IMPORT_SUPABASE_TIMEOUT_MIN_BATCH)))

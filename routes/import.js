@@ -7,11 +7,15 @@ import {
   resumeImport,
   downloadTemplate,
 } from '../controllers/importController.js';
+import { requireAuthSession } from '../middleware/authenticateSession.js';
+import { requireAdmin } from '../middleware/requireAdmin.js';
 
 const router = express.Router();
 
-router.get('/template', downloadTemplate);
-router.post('/', (req, res, next) => {
+router.use(requireAuthSession);
+
+router.get('/template', requireAdmin, downloadTemplate);
+router.post('/', requireAdmin, (req, res, next) => {
   uploadMiddleware(req, res, (err) => {
     if (err) {
       return res.status(400).json({ error: err.message || 'File upload failed' });
@@ -20,7 +24,7 @@ router.post('/', (req, res, next) => {
   });
 });
 router.get('/status/:jobId', getStatus);
-router.post('/cancel/:jobId', cancelImport);
-router.post('/resume/:jobId', resumeImport);
+router.post('/cancel/:jobId', requireAdmin, cancelImport);
+router.post('/resume/:jobId', requireAdmin, resumeImport);
 
 export default router;

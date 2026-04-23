@@ -18,7 +18,9 @@ if (!supabaseUrl) {
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-const serviceKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+const serviceKey = String(
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE_KEY || '',
+).trim();
 
 /** Service role client for INSERT/UPDATE/DELETE (bypasses RLS). Omit key to disable writes via REST. */
 export const supabaseAdmin =

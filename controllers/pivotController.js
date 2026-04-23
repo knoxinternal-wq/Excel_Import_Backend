@@ -15,10 +15,28 @@ const MAX_PIVOT_BODY_LIMIT = 100_000;
 
 const PIVOT_SQL_TIMEOUT_MESSAGE =
   'Pivot SQL timed out on the database server. Add filters or use fewer row/column fields.';
+const PIVOT_TOO_WIDE_MESSAGE =
+  'Pivot layout is too large for live execution. Add filters (FY/state/branch/brand) and remove high-cardinality fields like bill_no, item_no, or to_party_name.';
+
+function isPivotTooWideError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    msg.includes('pivot grouping produced too many rows')
+    || msg.includes('pivot too large')
+    || msg.includes('pivot layout is too wide')
+  );
+}
 
 function sendPivotSqlErrorResponse(res, err) {
   if (isPivotSqlStatementTimeoutError(err)) {
     return res.status(504).json({ error: PIVOT_SQL_TIMEOUT_MESSAGE, code: 'PIVOT_TIMEOUT' });
+  }
+  if (isPivotTooWideError(err)) {
+    return res.status(422).json({
+      error: PIVOT_TOO_WIDE_MESSAGE,
+      code: 'PIVOT_TOO_WIDE',
+      details: err?.message || null,
+    });
   }
   return res.status(400).json({ error: err.message });
 }

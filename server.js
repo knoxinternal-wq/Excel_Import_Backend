@@ -11,12 +11,22 @@ import historyRoutes from './routes/history.js';
 import authRoutes from './routes/auth.js';
 import adminRoutes from './routes/admin.js';
 import { endPgPool } from './config/database.js';
+import { checkPivotMvFreshness } from './services/pivotMvRefresh.js';
+import { validateEnvironment } from './config/env.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 5002;
+const envValidation = validateEnvironment();
+if (envValidation.warnings.length) {
+  envValidation.warnings.forEach((w) => console.warn(`[env] ${w}`));
+}
+if (envValidation.errors.length) {
+  const msg = envValidation.errors.join(' ');
+  throw new Error(`Environment validation failed: ${msg}`);
+}
 
 app.use(compression({ level: 6, threshold: 1024 }));
 app.use(cors());
@@ -69,6 +79,13 @@ const server = app.listen(PORT, () => {
     import('./services/pivotService.js')
       .then((m) => m.preloadCommonPivotFilterCaches?.())
       .catch(() => {});
+  }
+  const freshnessIntervalMin = Number(process.env.MV_FRESHNESS_CHECK_INTERVAL_MIN || 0);
+  if (Number.isFinite(freshnessIntervalMin) && freshnessIntervalMin > 0) {
+    const everyMs = Math.max(60_000, Math.floor(freshnessIntervalMin * 60_000));
+    setInterval(() => {
+      checkPivotMvFreshness().catch(() => {});
+    }, everyMs).unref();
   }
 });
 

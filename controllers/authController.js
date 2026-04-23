@@ -1,11 +1,7 @@
 import bcrypt from 'bcrypt';
 import { findUserByEmail } from '../queries/authQueries.js';
 import { getPgPool } from '../config/database.js';
-
-function makeSessionToken(email) {
-  const raw = `${email}:${Date.now()}`;
-  return Buffer.from(raw, 'utf8').toString('base64url');
-}
+import { signAuthSessionToken } from '../utils/authSessionToken.js';
 
 export async function login(req, res) {
   try {
@@ -55,7 +51,7 @@ export async function login(req, res) {
     }
 
     return res.json({
-      token: makeSessionToken(user.email),
+      token: signAuthSessionToken(user),
       user: {
         id: user.id,
         email: user.email,
