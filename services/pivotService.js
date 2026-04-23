@@ -104,15 +104,12 @@ const MAX_PIVOT_VISIBLE_CELLS = Math.max(
   Number(process.env.PIVOT_MAX_VISIBLE_CELLS) || 250_000,
 );
 
-function assertVisibleCellLimit(rowCount, colCount, metricCount) {
+function isWithinVisibleCellLimit(rowCount, colCount, metricCount) {
   const safeRowCount = Math.max(1, Number(rowCount) || 1);
   const safeColCount = Math.max(1, Number(colCount) || 1);
   const safeMetricCount = Math.max(1, Number(metricCount) || 1);
   const visibleCells = safeRowCount * safeColCount * safeMetricCount;
-  if (visibleCells <= MAX_PIVOT_VISIBLE_CELLS) return;
-  throw new Error(
-    `Pivot too large (${safeRowCount.toLocaleString('en-IN')} rows × ${safeColCount.toLocaleString('en-IN')} columns × ${safeMetricCount.toLocaleString('en-IN')} value(s) = ${visibleCells.toLocaleString('en-IN')} cells; limit ${MAX_PIVOT_VISIBLE_CELLS.toLocaleString('en-IN')}). Reduce row/column fields or apply filters.`,
-  );
+  return visibleCells <= MAX_PIVOT_VISIBLE_CELLS;
 }
 
 function pivotResultCacheKey(normalized) {
@@ -948,11 +945,6 @@ function assemblePivotFromCellMap(
     : [];
 
   const visibleCells = rowHeaders.length * columnHeaders.length * metricKeys.length;
-  if (visibleCells > MAX_PIVOT_VISIBLE_CELLS) {
-    throw new Error(
-      `Pivot too large (${rowHeaders.length.toLocaleString('en-IN')} rows × ${columnHeaders.length.toLocaleString('en-IN')} columns × ${metricKeys.length.toLocaleString('en-IN')} value(s) = ${visibleCells.toLocaleString('en-IN')} cells; limit ${MAX_PIVOT_VISIBLE_CELLS.toLocaleString('en-IN')}). Reduce row/column fields or apply filters.`,
-    );
-  }
 
   return {
     config: { ...normalized, values },
@@ -981,6 +973,7 @@ async function runPivotWithPostgres(normalized, sqlFilters, values, metricKeys) 
   const rowHeadersMap = new Map();
   const colHeadersMap = new Map();
   const cellMap = new Map();
+  let visibleCellsCapped = false;
 
   for (const raw of sqlRows) {
     const synthRow = {};
@@ -1003,10 +996,15 @@ async function runPivotWithPostgres(normalized, sqlFilters, values, metricKeys) 
     const colLabels = normalized.columns.map((f) => axisValueFromRow(synthRow, f));
     const rowKey = keyFromParts(rowLabels);
     const colKey = keyFromParts(colLabels);
+    const nextRowCount = rowHeadersMap.size + (rowHeadersMap.has(rowKey) ? 0 : 1);
+    const nextColCount = colHeadersMap.size + (colHeadersMap.has(colKey) ? 0 : 1);
+    if (!isWithinVisibleCellLimit(nextRowCount, nextColCount, metricKeys.length)) {
+      visibleCellsCapped = true;
+      break;
+    }
 
     if (!rowHeadersMap.has(rowKey)) rowHeadersMap.set(rowKey, { key: rowKey, labels: rowLabels });
     if (!colHeadersMap.has(colKey)) colHeadersMap.set(colKey, { key: colKey, labels: colLabels });
-    assertVisibleCellLimit(rowHeadersMap.size, colHeadersMap.size, metricKeys.length);
 
     const metricMap = materializeBucketsFromSqlRow(raw, values);
     if (!cellMap.has(rowKey)) cellMap.set(rowKey, new Map());
@@ -1026,6 +1024,7 @@ async function runPivotWithPostgres(normalized, sqlFilters, values, metricKeys) 
   return {
     ...assembled,
     _sqlExecution: execution || { type: 'GROUP_BY' },
+    _pivotVisibleCapped: visibleCellsCapped,
   };
 }
 
@@ -1037,6 +1036,8 @@ async function runPivotWithStream(normalized, sqlFilters, memFilters, values, me
   const cellMap = new Map();
   let sourceRows = 0;
   let filteredRows = 0;
+  let visibleCellsCapped = false;
+  let shouldStop = false;
 
   for await (const page of streamFilteredSalesPages(selectClause, sqlFilters)) {
     const enrichedPage = await enrichPage(page, agentMapHolder);
@@ -1048,15 +1049,23 @@ async function runPivotWithStream(normalized, sqlFilters, memFilters, values, me
       const colLabels = normalized.columns.map((f) => axisValueFromRow(row, f));
       const rowKey = keyFromParts(rowLabels);
       const colKey = keyFromParts(colLabels);
+      const nextRowCount = rowHeadersMap.size + (rowHeadersMap.has(rowKey) ? 0 : 1);
+      const nextColCount = colHeadersMap.size + (colHeadersMap.has(colKey) ? 0 : 1);
+      if (!isWithinVisibleCellLimit(nextRowCount, nextColCount, metricKeys.length)) {
+        visibleCellsCapped = true;
+        shouldStop = true;
+        break;
+      }
       if (!rowHeadersMap.has(rowKey)) rowHeadersMap.set(rowKey, { key: rowKey, labels: rowLabels });
       if (!colHeadersMap.has(colKey)) colHeadersMap.set(colKey, { key: colKey, labels: colLabels });
-      assertVisibleCellLimit(rowHeadersMap.size, colHeadersMap.size, metricKeys.length);
       const metricMap = ensureCell(cellMap, rowKey, colKey);
       values.forEach((v) => addValue(metricMap, `${v.agg}:${v.field}`, row[v.field], v.field));
     }
+    if (shouldStop) break;
   }
 
-  return assemblePivotFromCellMap(
+  return {
+    ...assemblePivotFromCellMap(
     normalized,
     values,
     metricKeys,
@@ -1065,7 +1074,9 @@ async function runPivotWithStream(normalized, sqlFilters, memFilters, values, me
     colHeadersMap,
     sourceRows,
     filteredRows,
-  );
+    ),
+    _pivotVisibleCapped: visibleCellsCapped,
+  };
 }
 
 export function getPivotFields() {
@@ -1154,13 +1165,26 @@ export async function runPivot(config = {}) {
   const sqlExecution = result?._sqlExecution || null;
 
   const cardinalityWarnings = getPivotCardinalityWarnings(normalized.rows, normalized.columns);
+  const runtimeWarnings = [];
+  if (result?._pivotVisibleCapped) {
+    runtimeWarnings.push(
+      `Pivot output was capped at ${MAX_PIVOT_VISIBLE_CELLS.toLocaleString('en-IN')} visible cells. Add filters for full detail.`,
+    );
+  }
+  if (sqlExecution?.groupRowsCapped) {
+    runtimeWarnings.push(
+      `Pivot grouped rows were capped at ${(Number(process.env.PIVOT_MAX_GROUP_ROWS) || 80_000).toLocaleString('en-IN')}. Add filters for full detail.`,
+    );
+  }
 
   result.meta = {
     ...result.meta,
     engine: usePostgresPivot ? 'postgres' : 'stream',
     executionMs,
     memFiltersCount: memFilters.length,
-    ...(cardinalityWarnings.length ? { warnings: cardinalityWarnings } : {}),
+    ...((cardinalityWarnings.length || runtimeWarnings.length)
+      ? { warnings: [...cardinalityWarnings, ...runtimeWarnings] }
+      : {}),
     ...(!usePostgresPivot && sqlDetails.reasons?.length
       ? { engineReasons: sqlDetails.reasons, streamFallbackReason: sqlDetails.reasons[0] }
       : {}),

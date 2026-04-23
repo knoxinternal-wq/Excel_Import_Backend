@@ -82,11 +82,23 @@ function getPivotMaxGroupRows() {
   return DEFAULT_PIVOT_MAX_GROUP_ROWS;
 }
 
-function assertGroupRowsWithinLimit(rows, limit, contextLabel) {
-  if ((rows?.length || 0) <= limit) return;
-  throw new Error(
-    `Pivot grouping produced too many rows (> ${limit.toLocaleString('en-IN')}) for ${contextLabel}. Add filters or reduce high-cardinality fields.`,
-  );
+function trimGroupRowsWithinLimit(rows, limit, contextLabel) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length <= limit) {
+    return { rows: list, capped: false, droppedRows: 0 };
+  }
+  const droppedRows = list.length - limit;
+  logWarn('pivotSql', 'PIVOT_GROUP_ROWS_CAPPED', {
+    context: contextLabel,
+    returned_rows: limit,
+    dropped_rows: droppedRows,
+    limit,
+  });
+  return {
+    rows: list.slice(0, limit),
+    capped: true,
+    droppedRows,
+  };
 }
 
 /** Pivot aggregation timeout: disabled (0) to avoid app-level cutoff on heavy SQL pivots. */
@@ -909,13 +921,19 @@ async function queryPivotFromResolvedMv(mv, normalized, sqlFilters) {
   `.trim();
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
-    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, `MV ${mv.name}`);
+    const capped = trimGroupRowsWithinLimit(groupRes.rows, maxGroupRows, `MV ${mv.name}`);
     await maybeLogPivotSqlExplain(client, mv.name, sql, params);
-    const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
+    const filteredRowCount = filteredRowCountFromGroupRows(capped.rows, values);
     return {
-      rows: groupRes.rows,
+      rows: capped.rows,
       filteredRowCount,
-      execution: { type: 'MV', mv: mv.name, relation: mv.relation },
+      execution: {
+        type: 'MV',
+        mv: mv.name,
+        relation: mv.relation,
+        groupRowsCapped: capped.capped,
+        droppedGroupRows: capped.droppedRows,
+      },
     };
   });
 }
@@ -1086,10 +1104,20 @@ async function queryPivotFromStateMonthMv(normalized, sqlFilters) {
   `.trim();
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
-    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV mv_state_month');
+    const capped = trimGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV mv_state_month');
     await maybeLogPivotSqlExplain(client, 'mv_state_month', sql, params);
-    const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
-    return { rows: groupRes.rows, filteredRowCount };
+    const filteredRowCount = filteredRowCountFromGroupRows(capped.rows, values);
+    return {
+      rows: capped.rows,
+      filteredRowCount,
+      execution: {
+        type: 'MV',
+        mv: 'mv_state_month',
+        relation: process.env.PIVOT_MV_STATE_MONTH || 'mv_sales_state_month',
+        groupRowsCapped: capped.capped,
+        droppedGroupRows: capped.droppedRows,
+      },
+    };
   });
 }
 
@@ -1135,10 +1163,20 @@ async function queryPivotFromBranchBrandMv(normalized, sqlFilters) {
   `.trim();
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
-    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV mv_branch_brand');
+    const capped = trimGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV mv_branch_brand');
     await maybeLogPivotSqlExplain(client, 'mv_branch_brand', sql, params);
-    const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
-    return { rows: groupRes.rows, filteredRowCount };
+    const filteredRowCount = filteredRowCountFromGroupRows(capped.rows, values);
+    return {
+      rows: capped.rows,
+      filteredRowCount,
+      execution: {
+        type: 'MV',
+        mv: 'mv_branch_brand',
+        relation: process.env.PIVOT_MV_BRANCH_BRAND || 'mv_sales_branch_brand',
+        groupRowsCapped: capped.capped,
+        droppedGroupRows: capped.droppedRows,
+      },
+    };
   });
 }
 
@@ -1218,10 +1256,20 @@ async function queryPivotFromAgentPartyMonthMv(normalized, sqlFilters) {
   `.trim();
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
-    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV mv_agent_party_month');
+    const capped = trimGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV mv_agent_party_month');
     await maybeLogPivotSqlExplain(client, 'mv_agent_party_month_rollup', sql, params);
-    const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
-    return { rows: groupRes.rows, filteredRowCount };
+    const filteredRowCount = filteredRowCountFromGroupRows(capped.rows, values);
+    return {
+      rows: capped.rows,
+      filteredRowCount,
+      execution: {
+        type: 'MV',
+        mv: 'mv_agent_party_month',
+        relation: process.env.PIVOT_MV_AGENT_PARTY_MONTH || 'mv_sales_agent_party_month',
+        groupRowsCapped: capped.capped,
+        droppedGroupRows: capped.droppedRows,
+      },
+    };
   });
 }
 
@@ -1248,10 +1296,20 @@ async function queryPivotFromSalesMv(sqlFilters, values) {
 
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(groupSql, params);
-    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV sales_mv');
+    const capped = trimGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'MV sales_mv');
     await maybeLogPivotSqlExplain(client, 'sales_mv', groupSql, params);
-    const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
-    return { rows: groupRes.rows, filteredRowCount };
+    const filteredRowCount = filteredRowCountFromGroupRows(capped.rows, values);
+    return {
+      rows: capped.rows,
+      filteredRowCount,
+      execution: {
+        type: 'MV',
+        mv: 'sales_mv',
+        relation: mvName,
+        groupRowsCapped: capped.capped,
+        droppedGroupRows: capped.droppedRows,
+      },
+    };
   });
 }
 
@@ -1373,13 +1431,17 @@ export async function queryPivotGroupBy(normalized, sqlFilters) {
 
   return withPivotSqlClient(async (client) => {
     const groupRes = await client.query(sql, params);
-    assertGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'sales_data group-by');
+    const capped = trimGroupRowsWithinLimit(groupRes.rows, maxGroupRows, 'sales_data group-by');
     await maybeLogPivotSqlExplain(client, 'sales_data_groupby', sql, params);
-    const filteredRowCount = filteredRowCountFromGroupRows(groupRes.rows, values);
+    const filteredRowCount = filteredRowCountFromGroupRows(capped.rows, values);
     return {
-      rows: groupRes.rows,
+      rows: capped.rows,
       filteredRowCount,
-      execution: { type: 'GROUP_BY' },
+      execution: {
+        type: 'GROUP_BY',
+        groupRowsCapped: capped.capped,
+        droppedGroupRows: capped.droppedRows,
+      },
     };
   });
 }
