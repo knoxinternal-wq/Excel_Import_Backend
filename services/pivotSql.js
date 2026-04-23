@@ -37,6 +37,31 @@ const NUMERIC_FIELDS = SALES_DATA_NUMERIC_COLUMNS_SET;
 
 const DATE_FIELDS = new Set(['bill_date', 'sale_order_date', 'created_at']);
 const PARTY_EQ_FIELDS = new Set(['to_party_name', 'party_grouped', 'party_name_for_count']);
+/**
+ * Exact-match dimensions that should avoid function-wrapped predicates in WHERE.
+ * Helps planner use partition pruning / indexes for large pivot GROUP BY queries.
+ */
+const FAST_TEXT_EQ_FIELDS = new Set([
+  'fy',
+  'month',
+  'mmm',
+  'business_type',
+  'branch',
+  'state',
+  'brand',
+  'agent_name_final',
+]);
+/**
+ * In current schema these are true numeric columns (DECIMAL/NUMERIC), so avoid
+ * expensive regex/text normalization in SQL hot paths.
+ */
+const STRICT_NUMERIC_SQL_FIELDS = new Set([
+  'rate_unit',
+  'sl_qty',
+  'gross_amount',
+  'amount_before_tax',
+  'net_amount',
+]);
 
 /** Wider default for large fact tables (1M+ rows); cap with PIVOT_MAX_GROUP_DIMENSIONS=4..32 */
 function getMaxGroupDimensions() {
@@ -82,7 +107,7 @@ function resolveStatementTimeoutMs(options = {}) {
 /** Larger hash aggregates for million-row GROUP BY (e.g. PIVOT_PG_WORK_MEM=256MB). */
 function pivotSessionWorkMemSql() {
   const raw = String(process.env.PIVOT_PG_WORK_MEM || '').trim();
-  if (!raw) return "SET LOCAL work_mem = '64MB'";
+  if (!raw) return "SET LOCAL work_mem = '192MB'";
   const compact = raw.replace(/\s+/g, '').toUpperCase();
   if (compact === '0' || compact === 'OFF' || compact === 'DEFAULT') return null;
   if (!/^\d+(KB|MB|GB|TB)$/.test(compact)) return null;
@@ -93,7 +118,7 @@ function pivotSessionWorkMemSql() {
 /** Parallel hash aggregate / seq scan (0–8). Empty env = leave server default. */
 function pivotSessionParallelGatherSql() {
   const raw = String(process.env.PIVOT_PG_PARALLEL_WORKERS || '').trim();
-  if (raw === '') return 'SET LOCAL max_parallel_workers_per_gather = 2';
+  if (raw === '') return 'SET LOCAL max_parallel_workers_per_gather = 4';
   const n = Math.floor(Number(raw));
   if (!Number.isFinite(n) || n < 0 || n > 8) return null;
   return `SET LOCAL max_parallel_workers_per_gather = ${n}`;
@@ -120,6 +145,11 @@ async function withPivotSqlClient(runner, options = {}) {
     if (wm) await client.query(wm);
     const par = pivotSessionParallelGatherSql();
     if (par) await client.query(par);
+    // Partitioned sales_data benefits from partitionwise aggregate for pivot GROUP BY.
+    await client.query('SET LOCAL enable_partitionwise_aggregate = on');
+    await client.query('SET LOCAL enable_partitionwise_join = on');
+    // JIT often adds latency for dashboard-style OLAP queries with frequent runs.
+    await client.query('SET LOCAL jit = off');
     const out = await runner(client);
     await client.query('COMMIT');
     return out;
@@ -236,10 +266,10 @@ function derivedTemporalAxisExpr(field, tableAlias = 'sd') {
     )`;
   }
   if (field === 'mmm') {
+    // Hot path optimization: `mmm` is persisted during import; direct read avoids costly date fallback per row.
     return `(
       CASE
         WHEN ${fieldCol} IS NOT NULL AND BTRIM(${fieldCol}::text) <> '' THEN BTRIM(${fieldCol}::text)
-        WHEN ${billDateCol} IS NOT NULL THEN UPPER(TO_CHAR(${billDateCol}::date, 'Mon'))
         ELSE NULL
       END
     )`;
@@ -256,6 +286,21 @@ function escapeIlike(s) {
     .replace(/\\/g, '\\\\')
     .replace(/%/g, '\\%')
     .replace(/_/g, '\\_');
+}
+
+/**
+ * Convert FY label (e.g. "2025-26") into [startDate, endDateExclusive] for bill_date partition pruning.
+ * Returns null for invalid labels.
+ */
+function fyToBillDateRange(value) {
+  const s = String(value ?? '').trim();
+  const m = s.match(/^(\d{4})-(\d{2})$/);
+  if (!m) return null;
+  const startYear = Number(m[1]);
+  if (!Number.isFinite(startYear) || startYear < 2000 || startYear > 2100) return null;
+  const start = `${startYear}-04-01`;
+  const end = `${startYear + 1}-04-01`;
+  return { start, end };
 }
 
 /**
@@ -416,6 +461,11 @@ function quoteRelationIdent(name) {
 }
 
 function resolveDistinctSource(field) {
+  // Fiscal/date-like filter dropdowns must reflect latest imported rows immediately.
+  // Using pre-aggregated MVs here can hide newly imported periods until MV refresh.
+  if (field === 'fy' || field === 'month' || field === 'mmm') {
+    return null;
+  }
   const byName = Object.fromEntries(getMvRegistry().map((mv) => [mv.name, mv]));
   const allDims = byName.sales_pivot_mv;
   if (allDims?.dimensions?.includes(field)) {
@@ -462,6 +512,9 @@ function partyFilterExpr(tableAlias, field) {
  */
 function numericCoerceExpr(tableAlias, field) {
   const col = `${tableAlias}.${quoteIdent(field)}`;
+  if (STRICT_NUMERIC_SQL_FIELDS.has(field)) {
+    return `(${col})::numeric`;
+  }
   if (field === 'units_pack') {
     const cleaned = `trim(replace(${col}::text, ',', ''))`;
     return `(CASE WHEN ${col} IS NULL OR trim(${col}::text) = '' THEN NULL WHEN ${cleaned} ~ '^[-+]?[0-9]+([.][0-9]*)?$' THEN ${cleaned}::numeric ELSE NULL END)`;
@@ -597,6 +650,21 @@ function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd', options = {}) {
 
     if (op === 'in') {
       const vals = Array.isArray(f.values) ? f.values : [];
+      if (f.field === 'fy') {
+        const ranges = vals
+          .map((v) => fyToBillDateRange(v))
+          .filter(Boolean);
+        if (ranges.length > 0) {
+          const billDateCol = `${tableAlias}.${quoteIdent('bill_date')}`;
+          const ors = ranges.map((r) => {
+            const p1 = next(r.start);
+            const p2 = next(r.end);
+            return `(${billDateCol} >= ${p1}::date AND ${billDateCol} < ${p2}::date)`;
+          });
+          appendWhere(parts, params, `(${ors.join(' OR ')})`);
+          continue;
+        }
+      }
       if (NUMERIC_FIELDS.has(f.field)) {
         const nums = vals.map((v) => parseFactNumeric(v, f.field)).filter((n) => n != null);
         if (!nums.length) continue;
@@ -618,6 +686,8 @@ function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd', options = {}) {
       if (PARTY_EQ_FIELDS.has(f.field)) {
         const partyExpr = partyFilterExpr(tableAlias, f.field);
         appendWhere(parts, params, `(${partyExpr} = ANY(${ph}::text[]))`);
+      } else if (FAST_TEXT_EQ_FIELDS.has(f.field)) {
+        appendWhere(parts, params, `(${col} = ANY(${ph}::text[]))`);
       } else {
         appendWhere(parts, params, `(BTRIM(COALESCE(${col}::text, '')) = ANY(${ph}::text[]))`);
       }
@@ -700,10 +770,22 @@ function buildWhereFromSqlFilters(sqlFilters, tableAlias = 'sd', options = {}) {
         }
         continue;
       }
+      if (f.field === 'fy') {
+        const r = fyToBillDateRange(v);
+        if (r) {
+          const billDateCol = `${tableAlias}.${quoteIdent('bill_date')}`;
+          const p1 = next(r.start);
+          const p2 = next(r.end);
+          appendWhere(parts, params, `(${billDateCol} >= ${p1}::date AND ${billDateCol} < ${p2}::date)`);
+          continue;
+        }
+      }
       const ph = next(v);
       if (PARTY_EQ_FIELDS.has(f.field)) {
         const partyExpr = partyFilterExpr(tableAlias, f.field);
         appendWhere(parts, params, `(${partyExpr} = ${ph})`);
+      } else if (FAST_TEXT_EQ_FIELDS.has(f.field)) {
+        appendWhere(parts, params, `(${col} = ${ph}::text)`);
       } else {
         appendWhere(parts, params, `(BTRIM(COALESCE(${col}::text, '')) = BTRIM(${ph}::text))`);
       }
@@ -1134,11 +1216,54 @@ async function maybeLogPivotSqlExplain(client, label, sql, params) {
 export async function queryPivotGroupBy(normalized, sqlFilters) {
   const pool = getPivotSqlPool();
   if (!pool) throw new Error('No database pool');
+  const hasTemporalContext = [
+    ...(normalized.rows || []),
+    ...(normalized.columns || []),
+    ...(sqlFilters || []).map((f) => f?.field).filter(Boolean),
+  ].some((f) => ['fy', 'month', 'mmm'].includes(f));
 
-  const mv = resolveBestMV(normalized, sqlFilters);
+  const shouldFallbackOnPossibleStaleMv = (mvEntry, mvResult) => {
+    if (!mvEntry || !mvResult) return false;
+    // `mv_sales_all_dims` can lag after imports when refresh is delayed/failed.
+    // If a fiscal/month-oriented layout/filter returns 0 from MV, retry on base table for correctness.
+    if (mvEntry.name !== 'sales_pivot_mv') return false;
+    const filteredCount = Number(mvResult.filteredRowCount || 0);
+    if (filteredCount > 0) return false;
+    const temporalFields = new Set(['fy', 'month', 'mmm']);
+    const hasTemporalAxis = [...(normalized.rows || []), ...(normalized.columns || [])]
+      .some((f) => temporalFields.has(f));
+    const hasTemporalFilter = (sqlFilters || []).some((f) => temporalFields.has(f?.field));
+    return hasTemporalAxis || hasTemporalFilter;
+  };
+
+  let mv = resolveBestMV(normalized, sqlFilters);
+  if (
+    mv?.name === 'sales_pivot_mv'
+    && hasTemporalContext
+    && String(process.env.PIVOT_SKIP_WIDE_MV_FOR_TEMPORAL || '1').trim() !== '0'
+  ) {
+    // Avoid spending seconds on a likely-stale wide MV probe for temporal pivots;
+    // jump directly to base-table GROUP BY for better tail latency.
+    logWarn('pivotSql', 'PIVOT_FALLBACK', {
+      reason: 'skip_wide_mv_temporal',
+      mv: mv.name,
+      relation: mv.relation,
+      config: normalized,
+    });
+    mv = null;
+  }
   if (mv) {
     try {
-      return await queryPivotFromResolvedMv(mv, normalized, sqlFilters);
+      const mvResult = await queryPivotFromResolvedMv(mv, normalized, sqlFilters);
+      if (!shouldFallbackOnPossibleStaleMv(mv, mvResult)) {
+        return mvResult;
+      }
+      logWarn('pivotSql', 'PIVOT_FALLBACK', {
+        reason: 'mv_possible_stale_temporal_zero',
+        mv: mv.name,
+        relation: mv.relation,
+        config: normalized,
+      });
     } catch (e) {
       logWarn('pivotSql', 'PIVOT_FALLBACK', {
         reason: 'mv_query_failed_groupby_fallback',

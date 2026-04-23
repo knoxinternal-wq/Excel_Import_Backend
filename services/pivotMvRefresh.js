@@ -50,3 +50,55 @@ export async function refreshPivotMVs() {
   }
   return { refreshed, skipped: false };
 }
+
+/**
+ * Lightweight post-refresh health check:
+ * verifies latest FY present in sales_data is also present in mv_sales_all_dims.
+ */
+export async function checkPivotMvFreshness() {
+  const pool = getPgPool();
+  if (!pool) {
+    logWarn('pivot_mv', 'health check skipped: no postgres pool');
+    return { ok: false, skipped: true };
+  }
+  const exists = await pool.query('SELECT to_regclass($1)::text AS rel', ['public.mv_sales_all_dims']);
+  if (!exists.rows?.[0]?.rel) {
+    logWarn('pivot_mv', 'health check skipped: mv_sales_all_dims missing');
+    return { ok: false, skipped: true };
+  }
+  const sql = `
+    WITH latest_fy AS (
+      SELECT fy, COUNT(1)::bigint AS src_rows
+      FROM sales_data
+      WHERE fy IS NOT NULL AND BTRIM(fy) <> ''
+      GROUP BY fy
+      ORDER BY SPLIT_PART(fy, '-', 1)::int DESC
+      LIMIT 1
+    ),
+    mv_fy AS (
+      SELECT fy, COUNT(1)::bigint AS mv_rows
+      FROM mv_sales_all_dims
+      WHERE fy IS NOT NULL AND BTRIM(fy) <> ''
+      GROUP BY fy
+    )
+    SELECT l.fy, l.src_rows, COALESCE(m.mv_rows, 0) AS mv_rows
+    FROM latest_fy l
+    LEFT JOIN mv_fy m ON m.fy = l.fy
+    LIMIT 1
+  `;
+  const { rows } = await pool.query(sql);
+  const row = rows?.[0];
+  if (!row) {
+    logWarn('pivot_mv', 'health check found no FY rows in sales_data');
+    return { ok: false, skipped: false, details: null };
+  }
+  const srcRows = Number(row.src_rows || 0);
+  const mvRows = Number(row.mv_rows || 0);
+  const details = { fy: row.fy, srcRows, mvRows };
+  if (srcRows > 0 && mvRows === 0) {
+    logWarn('pivot_mv', 'health check failed: latest FY missing in MV', details);
+    return { ok: false, skipped: false, details };
+  }
+  logInfo('pivot_mv', 'health check ok', details);
+  return { ok: true, skipped: false, details };
+}

@@ -98,6 +98,7 @@ function isGrandTotalRow(row) {
 const PIVOT_RESULT_CACHE_TTL_MS = Number(process.env.PIVOT_MEMORY_CACHE_TTL_MS) || 180_000;
 const PIVOT_RESULT_CACHE_MAX = 40;
 const pivotResultCache = new Map();
+const pivotResultInflight = new Map();
 const MAX_PIVOT_VISIBLE_CELLS = Math.max(
   50_000,
   Number(process.env.PIVOT_MAX_VISIBLE_CELLS) || 250_000,
@@ -1102,6 +1103,15 @@ export async function runPivot(config = {}) {
       _helpers: { readMetric },
     };
   }
+  const inflight = pivotResultInflight.get(pCacheKey);
+  if (inflight) {
+    const payload = await inflight;
+    return {
+      ...JSON.parse(JSON.stringify(payload)),
+      _helpers: { readMetric },
+    };
+  }
+  const computePromise = (async () => {
   const values = normalized.values;
   const { sqlFilters, memFilters } = splitFilters(normalized.filters);
   const metricKeys = values.map((v) => `${v.agg}:${v.field}`);
@@ -1187,7 +1197,14 @@ export async function runPivot(config = {}) {
   } catch {
     /* ignore cache serialization errors */
   }
-  return result;
+    return result;
+  })();
+  pivotResultInflight.set(pCacheKey, computePromise);
+  try {
+    return await computePromise;
+  } finally {
+    pivotResultInflight.delete(pCacheKey);
+  }
 }
 
 export async function runDrilldown(config = {}, drill = {}) {

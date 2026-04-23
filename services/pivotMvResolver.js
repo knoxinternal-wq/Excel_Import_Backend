@@ -157,6 +157,12 @@ export function resolveMvDimensionField(entry, requestedField) {
 function resolveRelation(entry) {
   const raw = String(process.env[entry.relationEnv] || '').trim();
   if (entry.relationEnv === 'PIVOT_MV_SALES' && raw === '0') return '';
+  // Wide "all dimensions" MV is extremely heavy; keep it opt-in only.
+  // Enable explicitly with PIVOT_SOURCE_RELATION=<mv_name> when infra can handle it.
+  if (entry.relationEnv === 'PIVOT_SOURCE_RELATION') {
+    if (!raw || raw === '0') return '';
+    return raw;
+  }
   if (raw && raw !== '0') return raw;
   return String(entry.defaultRelation || '').trim();
 }

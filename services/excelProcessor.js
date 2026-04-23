@@ -32,7 +32,7 @@ import { logError, logWarn, logDebug, logInfo } from '../utils/logger.js';
 import { parseExcelMoneyQtyCell, parseFactNumeric } from '../utils/salesFacts.js';
 import { invalidateMasterCachePrefix } from './masterLookupCache.js';
 import { getPgPool } from '../config/database.js';
-import { refreshPivotMVs } from './pivotMvRefresh.js';
+import { refreshPivotMVs, checkPivotMvFreshness } from './pivotMvRefresh.js';
 
 const NUMERIC_FIELDS_SET = new Set(NUMERIC_FIELDS);
 const DATE_FIELDS_SET = new Set(DATE_FIELDS);
@@ -475,7 +475,8 @@ function shouldRefreshPivotMvsAfterImport() {
 }
 
 function shouldRefreshPivotMvsAsync() {
-  return String(process.env.IMPORT_REFRESH_PIVOT_MVS_ASYNC || '1').trim() !== '0';
+  // Default synchronous to avoid stale MV windows after import completion.
+  return String(process.env.IMPORT_REFRESH_PIVOT_MVS_ASYNC || '0').trim() !== '0';
 }
 
 function detectImportMode() {
@@ -1200,15 +1201,32 @@ async function runQueuedImportJob(job) {
     if (shouldRefreshPivotMvsAfterImport()) {
       if (shouldRefreshPivotMvsAsync()) {
         // Do not block import completion response on heavy MV refresh work.
-        void refreshPivotMVs().catch((e) => {
-          logWarn('import', 'pivot MV refresh failed after import', {
-            jobId: job.jobId,
-            error: e?.message || String(e),
+        void refreshPivotMVs()
+          .then(() => checkPivotMvFreshness())
+          .then((health) => {
+            if (health?.ok === false && !health?.skipped) {
+              logWarn('import', 'pivot MV health check flagged mismatch after async refresh', {
+                jobId: job.jobId,
+                details: health?.details || null,
+              });
+            }
+          })
+          .catch((e) => {
+            logWarn('import', 'pivot MV refresh failed after import', {
+              jobId: job.jobId,
+              error: e?.message || String(e),
+            });
           });
-        });
       } else {
         try {
           await refreshPivotMVs();
+          const health = await checkPivotMvFreshness();
+          if (health?.ok === false && !health?.skipped) {
+            logWarn('import', 'pivot MV health check flagged mismatch after sync refresh', {
+              jobId: job.jobId,
+              details: health?.details || null,
+            });
+          }
         } catch (e) {
           logWarn('import', 'pivot MV refresh failed after import', {
             jobId: job.jobId,
