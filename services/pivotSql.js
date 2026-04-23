@@ -104,6 +104,27 @@ function resolveStatementTimeoutMs(options = {}) {
   return getPivotAggregationTimeoutMs();
 }
 
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientPivotDbError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  const code = String(err?.code || '').toLowerCase();
+  if (code === '57p01' || code === '57p02' || code === '57p03') return true; // admin/crash/cannot_connect_now
+  return (
+    msg.includes('connection terminated due to connection timeout')
+    || msg.includes('connection terminated unexpectedly')
+    || msg.includes('connection timeout')
+    || msg.includes('server closed the connection unexpectedly')
+    || msg.includes('terminating connection')
+    || msg.includes('ecconnreset')
+    || msg.includes('econnreset')
+    || msg.includes('timeout expired')
+    || msg.includes('could not connect')
+  );
+}
+
 /** Larger hash aggregates for million-row GROUP BY (e.g. PIVOT_PG_WORK_MEM=256MB). */
 function pivotSessionWorkMemSql() {
   const raw = String(process.env.PIVOT_PG_WORK_MEM || '').trim();
@@ -132,37 +153,49 @@ function pivotSessionParallelGatherSql() {
 async function withPivotSqlClient(runner, options = {}) {
   const p = getPivotSqlPool();
   if (!p) throw new Error('No database pool');
-  const client = await p.connect();
   const ms = resolveStatementTimeoutMs(options);
-  try {
-    await client.query('BEGIN');
-    if (ms === 0) {
-      await client.query('SET LOCAL statement_timeout = 0');
-    } else {
-      await client.query(`SET LOCAL statement_timeout = '${ms}ms'`);
-    }
-    const wm = pivotSessionWorkMemSql();
-    if (wm) await client.query(wm);
-    const par = pivotSessionParallelGatherSql();
-    if (par) await client.query(par);
-    // Partitioned sales_data benefits from partitionwise aggregate for pivot GROUP BY.
-    await client.query('SET LOCAL enable_partitionwise_aggregate = on');
-    await client.query('SET LOCAL enable_partitionwise_join = on');
-    // JIT often adds latency for dashboard-style OLAP queries with frequent runs.
-    await client.query('SET LOCAL jit = off');
-    const out = await runner(client);
-    await client.query('COMMIT');
-    return out;
-  } catch (e) {
+  const maxAttempts = Math.min(3, Math.max(1, Number(process.env.PIVOT_DB_RETRY_ATTEMPTS) || 2));
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const client = await p.connect();
     try {
-      await client.query('ROLLBACK');
-    } catch {
-      /* ignore */
+      await client.query('BEGIN');
+      if (ms === 0) {
+        await client.query('SET LOCAL statement_timeout = 0');
+      } else {
+        await client.query(`SET LOCAL statement_timeout = '${ms}ms'`);
+      }
+      const wm = pivotSessionWorkMemSql();
+      if (wm) await client.query(wm);
+      const par = pivotSessionParallelGatherSql();
+      if (par) await client.query(par);
+      // Partitioned sales_data benefits from partitionwise aggregate for pivot GROUP BY.
+      await client.query('SET LOCAL enable_partitionwise_aggregate = on');
+      await client.query('SET LOCAL enable_partitionwise_join = on');
+      // JIT often adds latency for dashboard-style OLAP queries with frequent runs.
+      await client.query('SET LOCAL jit = off');
+      const out = await runner(client);
+      await client.query('COMMIT');
+      return out;
+    } catch (e) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
+      if (!isTransientPivotDbError(e) || attempt >= maxAttempts) {
+        throw e;
+      }
+      logWarn('pivotSql', 'transient DB error; retrying pivot SQL', {
+        attempt,
+        maxAttempts,
+        error: e?.message || String(e),
+      });
+      await sleepMs(250 * attempt);
+    } finally {
+      client.release();
     }
-    throw e;
-  } finally {
-    client.release();
   }
+  throw new Error('Pivot SQL failed after retries');
 }
 
 /** Postgres cancel (statement_timeout) — map to HTTP 504 + PIVOT_TIMEOUT in controllers. */

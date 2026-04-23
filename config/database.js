@@ -129,7 +129,8 @@ function poolMinConnections(connectionString = '') {
 
 function poolConnectionTimeoutMs() {
   const n = Number(process.env.PG_CONNECTION_TIMEOUT_MS);
-  return Number.isFinite(n) && n >= 1000 ? Math.floor(n) : 5_000;
+  // 5s is too aggressive on cold starts / pooled Postgres handshakes (Render + Supabase).
+  return Number.isFinite(n) && n >= 1000 ? Math.floor(n) : 20_000;
 }
 
 /**
