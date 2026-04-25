@@ -63,6 +63,15 @@ const STRICT_NUMERIC_SQL_FIELDS = new Set([
   'net_amount',
 ]);
 
+/**
+ * Fast-path for all text dimensions:
+ * avoid BTRIM/CASE wrapping in SQL GROUP BY and normalize labels in Node.
+ * This typically improves wide pivot latency on large tables.
+ */
+function useFastRawDimensionGrouping() {
+  return String(process.env.PIVOT_SQL_RAW_DIM_GROUPING || '1').trim() !== '0';
+}
+
 /** Wider default for large fact tables (1M+ rows); cap with PIVOT_MAX_GROUP_DIMENSIONS=4..32 */
 function getMaxGroupDimensions() {
   const n = Number(process.env.PIVOT_MAX_GROUP_DIMENSIONS);
@@ -71,7 +80,7 @@ function getMaxGroupDimensions() {
 }
 
 const MAX_VALUE_SPECS = 12;
-const DEFAULT_PIVOT_MAX_GROUP_ROWS = 80_000;
+const DEFAULT_PIVOT_MAX_GROUP_ROWS = 400_000;
 const FILTER_VALUES_CACHE_TTL_MS = Number(process.env.PIVOT_FILTER_VALUES_CACHE_TTL_MS) || 30 * 60 * 1000;
 const FILTER_VALUES_CACHE_MAX = Number(process.env.PIVOT_FILTER_VALUES_CACHE_MAX) || 100;
 const filterValuesCache = new Map();
@@ -154,7 +163,7 @@ function isTransientPivotDbError(err) {
 /** Larger hash aggregates for million-row GROUP BY (e.g. PIVOT_PG_WORK_MEM=256MB). */
 function pivotSessionWorkMemSql() {
   const raw = String(process.env.PIVOT_PG_WORK_MEM || '').trim();
-  if (!raw) return "SET LOCAL work_mem = '192MB'";
+  if (!raw) return "SET LOCAL work_mem = '256MB'";
   const compact = raw.replace(/\s+/g, '').toUpperCase();
   if (compact === '0' || compact === 'OFF' || compact === 'DEFAULT') return null;
   if (!/^\d+(KB|MB|GB|TB)$/.test(compact)) return null;
@@ -165,7 +174,7 @@ function pivotSessionWorkMemSql() {
 /** Parallel hash aggregate / seq scan (0–8). Empty env = leave server default. */
 function pivotSessionParallelGatherSql() {
   const raw = String(process.env.PIVOT_PG_PARALLEL_WORKERS || '').trim();
-  if (raw === '') return 'SET LOCAL max_parallel_workers_per_gather = 4';
+  if (raw === '') return 'SET LOCAL max_parallel_workers_per_gather = 6';
   const n = Math.floor(Number(raw));
   if (!Number.isFinite(n) || n < 0 || n > 8) return null;
   return `SET LOCAL max_parallel_workers_per_gather = ${n}`;
@@ -948,6 +957,9 @@ function dimSelectExpr(field, alias) {
   if (DATE_FIELDS.has(field)) {
     return `(${col})::date AS ${alias}`;
   }
+  if (useFastRawDimensionGrouping()) {
+    return `${col} AS ${alias}`;
+  }
   return `(
     CASE
       WHEN ${col} IS NULL OR BTRIM(${col}::text) = '' THEN NULL
@@ -964,6 +976,9 @@ function dimGroupExpr(field) {
   }
   if (DATE_FIELDS.has(field)) {
     return `(${col})::date`;
+  }
+  if (useFastRawDimensionGrouping()) {
+    return col;
   }
   return `(
     CASE

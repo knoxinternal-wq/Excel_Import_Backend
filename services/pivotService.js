@@ -63,7 +63,9 @@ function getPivotCardinalityWarnings(rows, columns) {
 }
 
 function assertPivotCardinalityPreflight(normalized) {
-  if (String(process.env.PIVOT_PREFLIGHT_BLOCK_WIDE || '1').trim() === '0') return;
+  // Default OFF: users expect Excel-like freedom on rows/columns without hard stops.
+  // Set PIVOT_PREFLIGHT_BLOCK_WIDE=1 only when an environment explicitly wants strict blocking.
+  if (String(process.env.PIVOT_PREFLIGHT_BLOCK_WIDE || '0').trim() === '0') return;
   const axes = [...(normalized.rows || []), ...(normalized.columns || [])];
   if (!axes.length) return;
   const hasAnyFilter = Array.isArray(normalized.filters) && normalized.filters.length > 0;
@@ -101,7 +103,7 @@ const pivotResultCache = new Map();
 const pivotResultInflight = new Map();
 const MAX_PIVOT_VISIBLE_CELLS = Math.max(
   50_000,
-  Number(process.env.PIVOT_MAX_VISIBLE_CELLS) || 250_000,
+  Number(process.env.PIVOT_MAX_VISIBLE_CELLS) || 2_000_000,
 );
 
 function isWithinVisibleCellLimit(rowCount, colCount, metricCount) {
@@ -500,6 +502,26 @@ function materializeBucketsFromSqlRow(sqlRow, values) {
     metricMap.set(mk, b);
   }
   return metricMap;
+}
+
+function mergeMetricBucket(target, incoming) {
+  if (!incoming) return target;
+  target.sum += incoming.sum;
+  target.count += incoming.count;
+  target.min = target.min == null ? incoming.min : (incoming.min == null ? target.min : Math.min(target.min, incoming.min));
+  target.max = target.max == null ? incoming.max : (incoming.max == null ? target.max : Math.max(target.max, incoming.max));
+  return target;
+}
+
+function mergeMetricMaps(existing, incoming, metricKeys) {
+  const out = existing || new Map();
+  for (const mk of metricKeys) {
+    const inc = incoming?.get(mk);
+    if (!inc) continue;
+    const cur = out.get(mk) || initMetricBucket();
+    out.set(mk, mergeMetricBucket(cur, inc));
+  }
+  return out;
 }
 
 function filterMatch(row, f) {
@@ -1008,7 +1030,12 @@ async function runPivotWithPostgres(normalized, sqlFilters, values, metricKeys) 
 
     const metricMap = materializeBucketsFromSqlRow(raw, values);
     if (!cellMap.has(rowKey)) cellMap.set(rowKey, new Map());
-    cellMap.get(rowKey).set(colKey, metricMap);
+    const rowCells = cellMap.get(rowKey);
+    const existingMetricMap = rowCells.get(colKey);
+    rowCells.set(
+      colKey,
+      mergeMetricMaps(existingMetricMap, metricMap, metricKeys),
+    );
   }
 
   const assembled = assemblePivotFromCellMap(
