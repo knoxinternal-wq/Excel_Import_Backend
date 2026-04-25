@@ -524,6 +524,21 @@ function mergeMetricMaps(existing, incoming, metricKeys) {
   return out;
 }
 
+function isPivotPostgresConnectivityError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  const code = String(err?.code || '').toLowerCase();
+  return (
+    msg.includes('timeout exceeded when trying to connect')
+    || msg.includes('connection timeout')
+    || msg.includes('could not connect')
+    || msg.includes('connection terminated')
+    || code === '53300'
+    || code === '57p03'
+    || code === '08001'
+    || code === '08006'
+  );
+}
+
 function filterMatch(row, f) {
   if (!f || !f.field || !SALES_FIELDS.includes(f.field)) return true;
   const val = row[f.field];
@@ -1185,9 +1200,25 @@ export async function runPivot(config = {}) {
   }
 
   const t0 = Date.now();
-  const result = usePostgresPivot
-    ? await runPivotWithPostgres(normalized, sqlFilters, values, metricKeys)
-    : await runPivotWithStream(normalized, sqlFilters, memFilters, values, metricKeys);
+  let result;
+  let usedPostgresEngine = usePostgresPivot;
+  let postgresFallbackReason = null;
+  if (usePostgresPivot) {
+    try {
+      result = await runPivotWithPostgres(normalized, sqlFilters, values, metricKeys);
+    } catch (e) {
+      if (!isPivotPostgresConnectivityError(e)) throw e;
+      postgresFallbackReason = e?.message || 'postgres_connectivity_failure';
+      usedPostgresEngine = false;
+      logWarn('pivot', 'PIVOT_SQL_CONNECTIVITY_FALLBACK', {
+        reason: postgresFallbackReason,
+        config: normalized,
+      });
+      result = await runPivotWithStream(normalized, sqlFilters, memFilters, values, metricKeys);
+    }
+  } else {
+    result = await runPivotWithStream(normalized, sqlFilters, memFilters, values, metricKeys);
+  }
   const executionMs = Date.now() - t0;
   const sqlExecution = result?._sqlExecution || null;
 
@@ -1206,20 +1237,26 @@ export async function runPivot(config = {}) {
 
   result.meta = {
     ...result.meta,
-    engine: usePostgresPivot ? 'postgres' : 'stream',
+    engine: usedPostgresEngine ? 'postgres' : 'stream',
     executionMs,
     memFiltersCount: memFilters.length,
     ...((cardinalityWarnings.length || runtimeWarnings.length)
       ? { warnings: [...cardinalityWarnings, ...runtimeWarnings] }
       : {}),
-    ...(!usePostgresPivot && sqlDetails.reasons?.length
+    ...(!usedPostgresEngine && sqlDetails.reasons?.length
       ? { engineReasons: sqlDetails.reasons, streamFallbackReason: sqlDetails.reasons[0] }
+      : {}),
+    ...(postgresFallbackReason
+      ? {
+        postgresFallbackReason,
+        streamFallbackReason: postgresFallbackReason,
+      }
       : {}),
     ...(sqlExecution?.type === 'MV' ? { mv: sqlExecution.mv, mvRelation: sqlExecution.relation } : {}),
   };
 
   logInfo('pivot', 'PIVOT_EXECUTION', {
-    type: sqlExecution?.type || (usePostgresPivot ? 'GROUP_BY' : 'STREAM'),
+    type: sqlExecution?.type || (usedPostgresEngine ? 'GROUP_BY' : 'STREAM'),
     mv: sqlExecution?.mv || null,
     duration_ms: executionMs,
     rows: normalized.rows,
